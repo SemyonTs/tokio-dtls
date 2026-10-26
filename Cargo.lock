@@ -254,9 +254,9 @@ checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
 name = "dimpl13"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "389d5983a5c7cca2779e97252dbee6f2445d68ee9d97d9682739cf4602cb04d9"
+checksum = "8d4fe22eb1c4a54307d3833936470eaef389659664031f25551799f239eb5b08"
 dependencies = [
  "aes",
  "arrayvec",
