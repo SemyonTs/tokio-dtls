@@ -254,9 +254,9 @@ checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
 name = "dimpl13"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74a43694ea00d801b11bcec251e55c8dd1d4e317961f8dc51bf5e985a322e90f"
+checksum = "389d5983a5c7cca2779e97252dbee6f2445d68ee9d97d9682739cf4602cb04d9"
 dependencies = [
  "aes",
  "arrayvec",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "tokio-dtls"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dimpl13",
  "thiserror",

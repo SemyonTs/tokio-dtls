@@ -1,6 +1,6 @@
 [package]
 name = "tokio-dtls"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Async DTLS 1.3 for Tokio, powered by dimpl"
@@ -14,7 +14,7 @@ categories = ["network-programming", "cryptography"]
 path = "lib.rs"
 
 [dependencies]
-dimpl13 = { version = "0.9", features = ["rcgen"] }
+dimpl13 = { version = "0.10", features = ["rcgen"] }
 tokio = { version = "1", features = ["net", "time", "sync", "macros", "rt", "rt-multi-thread"] }
 thiserror = "2"
 tracing = "0.1"
