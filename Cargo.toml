@@ -14,7 +14,7 @@ categories = ["network-programming", "cryptography"]
 path = "lib.rs"
 
 [dependencies]
-dimpl13 = { path = "/home/a/dimpl", features = ["rcgen"] }
+dimpl13 = { version = "0.10.2", features = ["rcgen"] }
 tokio = { version = "1", features = ["net", "time", "sync", "macros", "rt", "rt-multi-thread"] }
 thiserror = "2"
 tracing = "0.1"
