@@ -131,6 +131,44 @@ The public API returns `Result<T, tokio_dtls::Error>`. Errors fall into two cate
 
 tokio-dtls's defaults (`max_queue_rx = 256`, `max_queue_tx = 256`) trade per-connection memory for headroom on mid-throughput workloads. At 256 / 256, the upper bound is ~576 KB per connection (2 × 256 × 1150 B), and this memory is used only when the queues are fully loaded. For minimal per-connection memory (as low as ~46 KB at dimpl13's own `30 / 10` defaults), build your own `Config` and pass it via `dtls_config`.
 
+## Examples
+
+The `examples/` directory contains two working end-to-end demos. They exercise the full extension set described above — **ALPN, SNI, Connection ID, Record Size Limit** — over a real application protocol: TFTP with RFC 2347–2349 option negotiation (`blksize`, `tsize`, `timeout`).
+
+| Example | Style | Uses | Demonstrates |
+|---|---|---|---|
+| [`examples/tftp-server.rs`](examples/tftp-server.rs) | async | `tokio_dtls::DtlsConnection` | `accept_with`, `recv`/`send`, graceful `close`, serving files from a directory |
+| [`examples/tftp-client.rs`](examples/tftp-client.rs) | sync | `dimpl13::Dtls` | Sans-IO event loop with `poll_output` / `handle_packet` / `handle_timeout` |
+
+Both binaries build an identical `Arc<dimpl13::Config>` — ALPN `"tftp/1"`, SNI `"tftp.local"`, an 8-byte Connection ID, and `record_size_limit(1200)` — so they interoperate with each other, and they also serve as a smoke test for the extension plumbing described above.
+
+### Running the examples
+
+Start the server in one terminal:
+
+```sh
+cargo run --example tftp-server -- 127.0.0.1:6969 ./public
+```
+
+The first argument is the bind address; the second is the directory to serve (must exist). The server accepts one DTLS session at a time, reuses the shared `Arc<Config>` / `Arc<DtlsCertificate>` via `ConfigOptions`, and logs the negotiated ALPN / SNI at the start of each session.
+
+In another terminal, fetch a file:
+
+```sh
+cargo run --example tftp-client -- 127.0.0.1:6969 README.md
+```
+
+The client sends an RRQ with `blksize=1024`, `tsize=0`, and `timeout=5`, honours the server's OACK, transfers the file in DATA/ACK blocks, and writes the result to `received_<filename>` in the current directory.
+
+### Why two different engines?
+
+`tftp-server.rs` uses `tokio_dtls` (the async wrapper), while `tftp-client.rs` uses `dimpl13` directly (the Sans-IO engine). The pair is deliberately asymmetric so the two integration models can be compared side by side:
+
+- **Server** — the `tokio_dtls` background task owns the socket, drives the timer wheel, and wakes the `recv` / `send` futures. The example body only implements the TFTP protocol.
+- **Client** — the application drives the `dimpl13` state machine by hand: `poll_output` drains packets, timers, and events; `handle_packet` feeds incoming datagrams; `handle_timeout` advances the logical clock. This is the pattern to follow when embedding `dimpl13` into an existing event loop that is not Tokio.
+
+Both examples use the same extension config (ALPN / SNI / Connection ID / Record Size Limit), so the DTLS-layer code is essentially identical — only the way the state machine is driven differs.
+
 ## Versioning and MSRV
 - The crate follows `dimpl13` versioning and shares its cryptographic fixes.
 - **MSRV**: Rust 1.88.0.
