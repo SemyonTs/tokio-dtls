@@ -1,5 +1,6 @@
-//! Async TFTP-over-DTLS 1.3 server with a served directory and RFC 2347–2349
-//! option negotiation (blksize, tsize, timeout).
+//! Async TFTP-over-DTLS 1.3 server with a served directory, using
+//! [`DtlsServer`] for connection multiplexing on a single UDP socket.
+//! Handles many concurrent peers, one DTLS session per peer address.
 //!
 //! ```sh
 //! cargo run --example tftp-server -- 127.0.0.1:6969 ./public
@@ -9,8 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
-use tokio_dtls::{ConfigOptions, DtlsConnection};
+use tokio_dtls::{ConfigOptions, DtlsConnection, DtlsServer};
 
 // ---------- Shared extension config ----------
 const ALPN: &[u8] = b"tftp/1";
@@ -51,7 +51,8 @@ fn build_config() -> Arc<dimpl13::Config> {
 
 // ---------- Entry point ----------
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let bind_addr = args.next().unwrap_or_else(|| "127.0.0.1:6969".into());
     let root = PathBuf::from(args.next().unwrap_or_else(|| ".".into()));
@@ -60,11 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let root = root.canonicalize()?;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()?;
-    rt.block_on(serve(&bind_addr, root))
+    serve(&bind_addr, root).await
 }
 
 async fn serve(bind_addr: &str, root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -76,42 +73,46 @@ async fn serve(bind_addr: &str, root: PathBuf) -> Result<(), Box<dyn std::error:
             .expect("generate server certificate"),
     );
 
+    let opts = ConfigOptions {
+        dtls_config: Some(Arc::clone(&config)),
+        dtls_cert: Some(Arc::clone(&cert)),
+        handshake_timeout: Duration::from_secs(15),
+        ..Default::default()
+    };
+
+    let mut server = DtlsServer::bind(bind_addr, |_der| true, opts).await?;
+    println!(
+        "TFTP server (multiplexed) on {}, root = {}",
+        server.local_addr(),
+        root.display()
+    );
+
     loop {
-        let socket = match UdpSocket::bind(bind_addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("bind {bind_addr} failed: {e}");
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-        };
-        println!("TFTP server on {bind_addr}, root = {}", root.display());
-
-        let opts = ConfigOptions {
-            dtls_config: Some(Arc::clone(&config)),
-            dtls_cert: Some(Arc::clone(&cert)),
-            handshake_timeout: Duration::from_secs(15),
-            ..Default::default()
-        };
-
-        match DtlsConnection::accept_with(socket, |_der| true, opts).await {
-            Ok(conn) => {
-                println!("--- session: peer={} ---", conn.peer_addr());
-                if let Some(p) = conn.negotiated_alpn() {
-                    println!("  ALPN: {}", String::from_utf8_lossy(p));
-                }
-                if let Some(s) = conn.peer_server_name() {
-                    println!("  SNI:  {s}");
-                }
-                if let Err(e) = handle_session(&conn, &root).await {
-                    eprintln!("session failed: {e}");
-                }
-            }
+        let conn = match server.accept().await {
+            Ok(c) => c,
             Err(e) => {
                 eprintln!("accept failed: {e}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
             }
-        }
+        };
+
+        let peer = conn.peer_addr();
+        let active = server.session_count();
+        let root = root.clone();
+
+        tokio::spawn(async move {
+            println!("--- session peer={peer} (active sessions: {active}) ---");
+            if let Some(p) = conn.negotiated_alpn() {
+                println!("  ALPN: {}", String::from_utf8_lossy(p));
+            }
+            if let Some(s) = conn.peer_server_name() {
+                println!("  SNI:  {s}");
+            }
+            if let Err(e) = handle_session(&conn, &root).await {
+                eprintln!("session {peer} failed: {e}");
+            }
+        });
     }
 }
 
@@ -307,7 +308,6 @@ fn safe_join(root: &Path, name: &str) -> Option<PathBuf> {
         }
     }
     let joined = root.join(p);
-    // Canonicalise to be sure we didn't escape root.
     let canon = joined.canonicalize().ok()?;
     if !canon.starts_with(root) {
         return None;
