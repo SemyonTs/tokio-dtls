@@ -13,9 +13,30 @@
 //! exposes no option to negotiate an older version. If a peer does not
 //! support DTLS 1.3, the handshake will fail.
 //!
+//! ## Certificate validation
+//!
+//! `dimpl13` sends only the peer's **leaf** certificate (DER) via
+//! `Output::PeerCert`. This crate forwards it to a [`CertValidator`]
+//! callback which returns `true` to accept. The callback is
+//! application-supplied and can implement any policy:
+//!
+//! - **Pinning / self-signed**: [`PinnedCertValidator`] compares the SHA-256
+//!   fingerprint of the peer's certificate against a known value. This is the
+//!   simplest and most common approach for self-signed DTLS deployments.
+//! - **WebPKI** (feature `webpki`): [`webpki::WebPkiVerifier`] performs full
+//!   RFC 5280 chain validation against a set of trust anchors (including the
+//!   Mozilla root store). Note that `dimpl13` does **not** forward
+//!   intermediate certificates, so if the leaf is signed by an intermediate
+//!   CA you must supply that intermediate explicitly via
+//!   `with_intermediate_der`/`pem`.
+//!
+//! The default shared config performs **no** validation; the application
+//! must always provide a validator.
+//!
 //! ## Negotiated parameters
 //!
-//! Four DTLS extensions are supported and exposed through [`dimpl13::Config`]:
+//! Four DTLS extensions are supported and exposed through
+//! [`dimpl13::Config`]:
 //!
 //! - **ALPN** (RFC 7301) — client and server exchange application protocols;
 //!   the server picks one. Read the result from
@@ -23,9 +44,9 @@
 //! - **SNI** (RFC 6066) — the client advertises the server name. Read it from
 //!   [`DtlsConnection::peer_server_name`] on the server side.
 //! - **Connection ID** (RFC 9146) — enables NAT rebinding without losing the
-//!   association. Only active if **both** sides configure one; otherwise it is
-//!   silently disabled and the wire format falls back to the standard record
-//!   header. Transparent to [`send`](DtlsConnection::send) /
+//!   association. Only active if **both** sides configure one; otherwise it
+//!   is silently disabled and the wire format falls back to the standard
+//!   record header. Transparent to [`send`](DtlsConnection::send) /
 //!   [`recv`](DtlsConnection::recv).
 //! - **Record Size Limit** (RFC 8449) — each side advertises a maximum
 //!   outgoing record size; the peer's limit is automatically applied to our
@@ -37,19 +58,14 @@
 //! [`dimpl13`] emits `Output::KeyingMaterial(material, profile)`
 //! (RFC 5764 / RFC 7714) for use with an SRTP stack. This crate forwards
 //! that variant and exposes it via [`DtlsConnection::keying_material`].
-//! The returned tuple is `(raw_keying_material, srtp_profile)`:
 //!
-//! - `material` is typically `2 * (key_len + salt_len)` bytes
-//!   (`60` for AES-CM-128 / HMAC-SHA1-80).
-//! - `profile` (re-exported as [`SrtpProfile`]) selects the SRTP
-//!   cipher/suite in your SRTP stack.
-//!
-//! The default shared config does **not** negotiate `use_srtp`; configure
-//! SRTP-related `Config` options explicitly via [`ConfigOptions::dtls_config`]
-//! if your SRTP stack requires it. If `use_srtp` was not negotiated, the
-//! engine never produces `KeyingMaterial` and
-//! [`keying_material`](DtlsConnection::keying_material) will return `None`
-//! once the connection terminates.
+//! **Note:** `dimpl13 0.10.2` does not expose a public API to enable
+//! `use_srtp`. Unless a custom engine configuration is injected through a
+//! future `dimpl13` version, `Output::KeyingMaterial` is never produced and
+//! [`keying_material`](DtlsConnection::keying_material) resolves to `None`.
+//! The method is exposed for forward compatibility and for applications
+//! built on top of a newer engine or a custom build that does negotiate
+//! `use_srtp`.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,7 +73,6 @@
 //! let conn = DtlsConnection::connect("127.0.0.1:4433", |_| true).await?;
 //! if let Some((material, profile)) = conn.keying_material().await {
 //!     println!("SRTP profile: {:?}, {} bytes", profile, material.len());
-//!     // feed `material` + `profile` into your SRTP context
 //! }
 //! # Ok(())
 //! # }
@@ -68,16 +83,14 @@
 //! [`DtlsServer`] binds one `UdpSocket` and demultiplexes incoming datagrams
 //! by peer address, spawning a per-peer DTLS engine. Each accepted
 //! [`DtlsConnection`] is independent: its own handshake, its own certificate
-//! validator, its own keying material. The accept queue is bounded
-//! (currently 64 handshake-complete connections); further handshakes block
-//! until the application calls [`DtlsServer::accept`].
+//! validator, its own keying material.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use tokio_dtls::{ConfigOptions, DtlsServer};
 //! let mut server = DtlsServer::bind(
 //!     "0.0.0.0:4433",
-//!     |_cert| true, // Replace with real validation!
+//!     |_cert| true,
 //!     ConfigOptions::default(),
 //! ).await?;
 //! loop {
@@ -87,42 +100,15 @@
 //!         let _ = conn.recv().await;
 //!     });
 //! }
+//! # Ok(())
 //! # }
 //! ```
 //!
 //! ## Performance
 //!
-//! A process-wide `Arc<Config>` and `Arc<DtlsCertificate>` are created lazily
-//! on first use and reused for every subsequent connection. This removes the
-//! per-connection cost of `Config::builder().build()` (crypto provider
-//! validation — 6 ECDHE round-trips, ~0.7 ms measured on reference hardware)
-//! and `generate_self_signed_certificate()` (ECDSA keygen, ~70 µs measured),
-//! both of which would otherwise dominate a loopback handshake.
-//!
-//! Call [`warmup`] once at process startup to move the first-use cost
-//! (AWS-LC-RS init + `rcgen` first key + provider validation — up to ~90 ms on
-//! some platforms) out of the first handshake and into a predictable startup
-//! phase:
-//!
-//! ```no_run
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! tokio_dtls::warmup().await?;
-//! // ... start accepting / connecting ...
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! After warmup, `p50` handshake on loopback is ~0.9 ms in sequential
-//! connect benchmarks (`cargo bench --bench handshake`). The remaining time
-//! is split between `Dtls::new_13` (private-key parsing) and the four tokio
-//! task-switches per handshake flight, neither of which is under this
-//! crate's control.
-//!
-//! If you need custom queue sizes or your own certificate, build the
-//! `Arc<Config>` / `Arc<DtlsCertificate>` yourself once and pass them via
-//! [`ConfigOptions::dtls_config`] / [`ConfigOptions::dtls_cert`]. When both
-//! are `Some`, connection setup is a pure `Arc::clone` with no blocking-pool
-//! involvement — strictly faster than the shared-cache path.
+//! A process-wide `Arc<Config>` and `Arc<DtlsCertificate>` are lazily
+//! created and reused. Call [`warmup`] once at startup to move the one-time
+//! cost (~10–90 ms) out of the first handshake.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -140,10 +126,6 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 /// SRTP protection profile selected via `use_srtp` (RFC 5764 / RFC 7714).
-///
-/// Re-exported from [`dimpl13`] so callers of
-/// [`DtlsConnection::keying_material`] can match on it without depending on
-/// `dimpl13` directly.
 pub use dimpl13::SrtpProfile;
 
 // ---------------------------------------------------------------------------
@@ -164,13 +146,9 @@ const SLEEP_MAX: Duration = Duration::from_secs(3600 * 24);
 const SPIN_YIELD_BEFORE_SLEEP: u32 = 8;
 const SPIN_SLEEP: Duration = Duration::from_micros(50);
 
-/// Per-session inbound-packet queue capacity (multiplexed path).
 const SESSION_PACKET_CHANNEL: usize = 128;
-/// Accept queue capacity on [`DtlsServer`].
 const ACCEPT_QUEUE: usize = 64;
-/// Largest UDP datagram we will read from a shared socket.
 const MUX_BUF_SIZE: usize = 65535;
-/// Backoff when the multiplexer's `recv_from` errors.
 const MUX_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
 // ---------------------------------------------------------------------------
@@ -221,16 +199,293 @@ pub enum Error {
 type Result<T> = std::result::Result<T, Error>;
 
 // ---------------------------------------------------------------------------
-// HandshakeInfo (private)
+// Certificate helpers
 // ---------------------------------------------------------------------------
 
-/// Values captured at the moment the handshake completes.
+/// Certificate validation callbacks.
+pub mod cert {
+    use std::sync::Arc;
+
+    use dimpl13::certificate;
+
+    /// Certificate validator callback.
+    ///
+    /// Receives the peer's leaf certificate in DER format. Return `true` to
+    /// accept.
+    pub type CertValidator = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
+    /// A validator that pins the SHA-256 fingerprint of the peer's
+    /// certificate.
+    ///
+    /// This is the recommended approach for **self-signed** certificates
+    /// (common in DTLS deployments). It does not perform any chain building
+    /// and therefore works with certificates that are not CAs.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use tokio_dtls::cert::PinnedCertValidator;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let server_cert_der: Vec<u8> = std::fs::read("peer-cert.der")?;
+    /// let validator = PinnedCertValidator::new(&server_cert_der).into_validator();
+    /// # let _ = validator;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[derive(Clone)]
+    pub struct PinnedCertValidator {
+        expected: [u8; 32],
+    }
+
+    impl PinnedCertValidator {
+        /// Creates a pin from a DER-encoded certificate.
+        pub fn new(cert_der: &[u8]) -> Self {
+            let fp = certificate::calculate_fingerprint(cert_der);
+            let mut expected = [0u8; 32];
+            expected.copy_from_slice(&fp);
+            Self { expected }
+        }
+
+        /// Creates a pin from a precomputed SHA-256 fingerprint.
+        pub fn from_fingerprint(fingerprint: [u8; 32]) -> Self {
+            Self {
+                expected: fingerprint,
+            }
+        }
+
+        /// Returns `true` if the given DER certificate matches the pinned
+        /// fingerprint.
+        pub fn verify(&self, cert_der: &[u8]) -> bool {
+            certificate::calculate_fingerprint(cert_der) == self.expected
+        }
+
+        /// Converts into a [`CertValidator`] closure.
+        pub fn into_validator(self) -> CertValidator {
+            Arc::new(move |der: &[u8]| self.verify(der))
+        }
+    }
+}
+
+pub use cert::CertValidator;
+
+// ---------------------------------------------------------------------------
+// WebPKI (feature `webpki`)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "webpki")]
+/// Ready-made [`CertValidator`] implementations based on
+/// [`rustls-webpki`](https://docs.rs/rustls-webpki).
 ///
-/// Read via [`DtlsConnection::negotiated_alpn`] and
-/// [`DtlsConnection::peer_server_name`]. Stored inside an `OnceLock` because
-/// in the multiplexed path the connection handle is constructed *before* the
-/// handshake completes; the engine task fills it in when `Output::Connected`
-/// arrives.
+/// Available when the `webpki` Cargo feature is enabled. Without the feature
+/// the crate has no WebPKI dependency and the application must supply its
+/// own validator (e.g. [`crate::cert::PinnedCertValidator`]).
+///
+/// # Important: `dimpl13` sends only the leaf certificate
+///
+/// `dimpl13` emits `Output::PeerCert(leaf_der)` and does **not** forward the
+/// intermediate certificates from the TLS `Certificate` message. If the
+/// peer's leaf is signed by an intermediate CA (the normal case for publicly
+/// trusted certificates), chain building fails unless you add the
+/// intermediate(s) yourself via
+/// [`WebPkiVerifierBuilder::with_intermediate_der`] (or the PEM variant).
+///
+/// For self-signed certificates, prefer [`crate::cert::PinnedCertValidator`].
+///
+/// # Performance
+///
+/// Trust anchors provided as raw DER (`trust_anchor_der`) are re-parsed on
+/// every handshake (once per [`WebPkiVerifier::verify`] call). The Mozilla
+/// root store from [`webpki-roots`](https://docs.rs/webpki-roots) is used
+/// pre-parsed, so `with_webpki_roots()` incurs no per-handshake cost for the
+/// root store itself.
+pub mod webpki {
+    use std::sync::Arc;
+
+    use rustls_pki_types::{CertificateDer, ServerName, TrustAnchor, UnixTime};
+    use rustls_webpki::{ALL_VERIFICATION_ALGS, EndEntityCert, KeyUsage, anchor_from_trusted_cert};
+
+    use crate::CertValidator;
+
+    /// Errors returned by [`WebPkiVerifier`].
+    #[derive(Debug, thiserror::Error)]
+    pub enum WebPkiError {
+        /// No trust anchors configured.
+        #[error("no trust anchors configured; call trust_anchor_der/pem or with_webpki_roots")]
+        NoTrustAnchors,
+        /// PEM parsing failed.
+        #[error("PEM parsing failed: {0}")]
+        Pem(String),
+        /// The peer's leaf certificate could not be parsed.
+        #[error("invalid peer certificate: {0}")]
+        InvalidCertificate(#[from] rustls_webpki::Error),
+        /// Chain / signature / validity / EKU check failed.
+        #[error("certificate validation failed: {0}")]
+        Validation(rustls_webpki::Error),
+        /// Subject name mismatch.
+        #[error("subject name mismatch: {0}")]
+        NameMismatch(rustls_webpki::Error),
+    }
+
+    /// Builder for [`WebPkiVerifier`].
+    #[derive(Default)]
+    pub struct WebPkiVerifierBuilder {
+        anchor_ders: Vec<Vec<u8>>,
+        intermediate_ders: Vec<Vec<u8>>,
+        use_webpki_roots: bool,
+        server_name: Option<ServerName<'static>>,
+        usage: Option<KeyUsage>,
+    }
+
+    impl WebPkiVerifierBuilder {
+        /// Adds a DER trust anchor.
+        pub fn trust_anchor_der(mut self, der: Vec<u8>) -> Self {
+            self.anchor_ders.push(der);
+            self
+        }
+        /// Adds a PEM trust anchor (first cert in document).
+        pub fn trust_anchor_pem(self, pem: &[u8]) -> Result<Self, WebPkiError> {
+            let der = parse_first_pem_cert(pem)?;
+            Ok(self.trust_anchor_der(der))
+        }
+        /// Adds the Mozilla root store.
+        pub fn with_webpki_roots(mut self) -> Self {
+            self.use_webpki_roots = true;
+            self
+        }
+        /// Adds a DER intermediate.
+        pub fn with_intermediate_der(mut self, der: Vec<u8>) -> Self {
+            self.intermediate_ders.push(der);
+            self
+        }
+        /// Adds a PEM intermediate (first cert in document).
+        pub fn with_intermediate_pem(self, pem: &[u8]) -> Result<Self, WebPkiError> {
+            let der = parse_first_pem_cert(pem)?;
+            Ok(self.with_intermediate_der(der))
+        }
+        /// Requires the peer cert to be valid for `name`.
+        pub fn with_server_name(mut self, name: ServerName<'static>) -> Self {
+            self.server_name = Some(name);
+            self
+        }
+        /// Sets `KeyUsage` (default `server_auth`).
+        pub fn with_key_usage(mut self, usage: KeyUsage) -> Self {
+            self.usage = Some(usage);
+            self
+        }
+        /// Builds the verifier. Fails early if no anchors were configured.
+        pub fn build(self) -> Result<WebPkiVerifier, WebPkiError> {
+            if self.anchor_ders.is_empty() && !self.use_webpki_roots {
+                return Err(WebPkiError::NoTrustAnchors);
+            }
+            Ok(WebPkiVerifier {
+                anchor_ders: Arc::from(self.anchor_ders),
+                intermediate_ders: Arc::from(self.intermediate_ders),
+                use_webpki_roots: self.use_webpki_roots,
+                server_name: self.server_name,
+                usage: self.usage.unwrap_or_else(KeyUsage::server_auth),
+            })
+        }
+    }
+
+    /// A [`CertValidator`] backed by `rustls-webpki`.
+    #[derive(Clone)]
+    pub struct WebPkiVerifier {
+        anchor_ders: Arc<[Vec<u8>]>,
+        intermediate_ders: Arc<[Vec<u8>]>,
+        use_webpki_roots: bool,
+        server_name: Option<ServerName<'static>>,
+        usage: KeyUsage,
+    }
+
+    impl WebPkiVerifier {
+        /// Creates a new builder.
+        pub fn builder() -> WebPkiVerifierBuilder {
+            WebPkiVerifierBuilder::default()
+        }
+
+        /// Verifies a DER-encoded peer leaf certificate.
+        pub fn verify(&self, leaf_der: &[u8]) -> Result<(), WebPkiError> {
+            let owned_anchors: Vec<CertificateDer<'static>> = self
+                .anchor_ders
+                .iter()
+                .map(|der| CertificateDer::from(der.clone()))
+                .collect();
+
+            let mut anchors: Vec<TrustAnchor<'_>> =
+                Vec::with_capacity(owned_anchors.len() + webpki_roots::TLS_SERVER_ROOTS.len());
+            for cert in &owned_anchors {
+                match anchor_from_trusted_cert(cert) {
+                    Ok(a) => anchors.push(a),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "skipping invalid trust anchor"
+                    ),
+                }
+            }
+            if self.use_webpki_roots {
+                anchors.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            }
+            if anchors.is_empty() {
+                return Err(WebPkiError::NoTrustAnchors);
+            }
+
+            let intermediates: Vec<CertificateDer<'static>> = self
+                .intermediate_ders
+                .iter()
+                .map(|der| CertificateDer::from(der.clone()))
+                .collect();
+
+            let leaf = CertificateDer::from(leaf_der);
+            let cert = EndEntityCert::try_from(&leaf)?;
+
+            cert.verify_for_usage(
+                ALL_VERIFICATION_ALGS,
+                &anchors,
+                &intermediates,
+                UnixTime::now(),
+                self.usage,
+                None, // revocation
+                None, // verify_path
+            )
+            .map_err(WebPkiError::Validation)?;
+
+            if let Some(name) = &self.server_name {
+                cert.verify_is_valid_for_subject_name(name)
+                    .map_err(WebPkiError::NameMismatch)?;
+            }
+
+            Ok(())
+        }
+
+        /// Converts into a [`CertValidator`] closure.
+        pub fn into_validator(self) -> CertValidator {
+            let this = Arc::new(self);
+            Arc::new(move |der: &[u8]| match this.verify(der) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::debug!(error = %e, "peer certificate rejected");
+                    false
+                }
+            })
+        }
+    }
+
+    fn parse_first_pem_cert(pem: &[u8]) -> Result<Vec<u8>, WebPkiError> {
+        let mut reader = std::io::BufReader::new(pem);
+        let mut certs = rustls_pemfile::certs(&mut reader);
+        certs
+            .next()
+            .ok_or_else(|| WebPkiError::Pem("no certificate found in PEM".into()))?
+            .map(|der| der.as_ref().to_vec())
+            .map_err(|e| WebPkiError::Pem(e.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HandshakeInfo
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Default)]
 struct HandshakeInfo {
     negotiated_alpn: Option<Vec<u8>>,
@@ -251,72 +506,47 @@ impl HandshakeInfo {
 // ---------------------------------------------------------------------------
 
 /// Configuration for a [`DtlsConnection`] or [`DtlsServer`].
-///
-/// # Performance
-///
-/// By default, a process-wide `Arc<Config>` and `Arc<DtlsCertificate>` are
-/// created lazily on first use and reused for every subsequent connection.
-/// The fast path — both values already resolved (either provided here or
-/// cached process-wide), default queue sizes — returns `Arc::clone` without
-/// waking the blocking pool.
-///
-/// If you need custom queue sizes, ALPN protocols, SNI, Connection ID, a
-/// custom Record Size Limit, or your own certificate, build the
-/// `Arc<Config>` / `Arc<DtlsCertificate>` yourself and pass them via
-/// [`dtls_config`](Self::dtls_config) / [`dtls_cert`](Self::dtls_cert).
 #[derive(Debug, Clone)]
 pub struct ConfigOptions {
-    /// Maximum time to wait for handshake completion.
-    ///
-    /// Default: 30 s.
+    /// Maximum time to wait for handshake completion. Default: 30 s.
     pub handshake_timeout: Duration,
 
     /// Initial size of the `poll_output` buffer. Grows on `BufferTooSmall`.
-    ///
-    /// Default: 2048. Raise this if you use jumbo MTUs (> 2048 bytes).
-    /// Also sets the minimum UDP receive buffer size.
+    /// Also sets the minimum UDP receive buffer size. Default: 2048.
     pub initial_buffer_size: usize,
 
     /// Maximum number of records in the DTLS receive queue.
     ///
     /// Only used when [`dtls_config`](Self::dtls_config) is `None` **and**
-    /// the value differs from tokio-dtls's default (`256`). Otherwise the
-    /// process-wide shared config's value applies (`256`).
+    /// the value differs from tokio-dtls's default (`256`).
     pub max_queue_rx: usize,
 
     /// Maximum number of records in the DTLS transmit queue.
     ///
     /// Only used when [`dtls_config`](Self::dtls_config) is `None` **and**
-    /// the value differs from tokio-dtls's default (`256`). Otherwise the
-    /// process-wide shared config's value applies (`256`).
+    /// the value differs from tokio-dtls's default (`256`).
     pub max_queue_tx: usize,
 
-    /// Capacity of the internal handle ↔ engine channels.
-    ///
-    /// Default: 1024.
+    /// Capacity of the internal handle ↔ engine channels. Default: 1024.
     pub channel_capacity: usize,
 
     /// Pre-built DTLS config. `None` = use the process-wide shared instance.
     ///
-    /// **Recommended for production**: `Some(Arc::new(your_config))`. When
-    /// both this and [`dtls_cert`](Self::dtls_cert) are `Some`, connection
-    /// setup is a pure `Arc::clone` with no blocking-pool involvement — the
-    /// fastest possible path.
+    /// The shared default config advertises no ALPN, no SNI, no CID and
+    /// uses the default Record Size Limit. **Pass a custom `Config` to
+    /// enable any of those.**
     ///
-    /// The shared default config advertises no ALPN protocols, no SNI, no
-    /// Connection ID, and the default Record Size Limit. **You must pass a
-    /// custom `Config` to enable any of those.**
+    /// - `.alpn_protocols(&[b"h2", b"http/1.1"])`
+    /// - `.server_name("example.com")`
+    /// - `.connection_id(&[0xAA, 0xBB])`
+    /// - `.record_size_limit(1200)`
     ///
-    /// Configure via `dimpl13::Config::builder()`:
-    ///
-    /// - `.alpn_protocols(&[b"h2", b"http/1.1"])` — advertise ALPN on both
-    ///   client and server.
-    /// - `.server_name("example.com")` — client sends SNI.
-    /// - `.connection_id(&[0xAA, 0xBB])` — RFC 9146 Connection ID.
-    /// - `.record_size_limit(1200)` — RFC 8449 Record Size Limit.
+    /// SRTP (`use_srtp`) is not yet configurable through `dimpl13 0.10.2`'s
+    /// public `ConfigBuilder`; see [`DtlsConnection::keying_material`].
     pub dtls_config: Option<Arc<Config>>,
 
-    /// Pre-generated certificate. `None` = use the process-wide shared instance.
+    /// Pre-generated certificate. `None` = use the process-wide shared
+    /// instance.
     pub dtls_cert: Option<Arc<DtlsCertificate>>,
 }
 
@@ -342,7 +572,6 @@ static SHARED_CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
 static SHARED_CERT: OnceLock<Arc<DtlsCertificate>> = OnceLock::new();
 static WARNED_CUSTOM_QUEUE: AtomicBool = AtomicBool::new(false);
 
-/// Synchronous resolver — used from `spawn_blocking` and `warmup`.
 fn resolve_config(opts: &ConfigOptions) -> Result<Arc<Config>> {
     if let Some(cfg) = &opts.dtls_config {
         return Ok(Arc::clone(cfg));
@@ -425,8 +654,8 @@ async fn resolve_shared(opts: &ConfigOptions) -> Result<(Arc<Config>, Arc<DtlsCe
 
 /// Pre-generates the process-wide shared [`Config`] and [`DtlsCertificate`].
 ///
-/// Call this once at startup to move the one-time `aws-lc-rs` / `rcgen` /
-/// crypto-provider-validation cost (~10–90 ms depending on platform) out of
+/// Call once at startup to move the one-time cost (~10–90 ms: `aws-lc-rs`
+/// initialization, the first `rcgen` key, crypto-provider validation) out of
 /// the first handshake and into a predictable startup phase.
 ///
 /// Safe to call from multiple tasks; the work is idempotent.
@@ -442,16 +671,7 @@ pub async fn warmup() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// CertValidator
-// ---------------------------------------------------------------------------
-
-/// Certificate validator callback.
-///
-/// Receives the peer's leaf certificate in DER format. Return `true` to accept.
-pub type CertValidator = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
-
-// ---------------------------------------------------------------------------
-// Transport (private)
+// Transport
 // ---------------------------------------------------------------------------
 
 /// Abstracts over "owning a connected UDP socket" and "sharing a socket with
@@ -516,8 +736,9 @@ impl Transport {
 ///
 /// ## Negotiated parameters
 ///
-/// [`negotiated_alpn`](Self::negotiated_alpn), [`peer_server_name`](Self::peer_server_name)
-/// and [`keying_material`](Self::keying_material) are available once the
+/// [`negotiated_alpn`](Self::negotiated_alpn),
+/// [`peer_server_name`](Self::peer_server_name) and
+/// [`keying_material`](Self::keying_material) are available once the
 /// handshake has completed, which is guaranteed by the time
 /// `connect*`/`accept*` returns.
 #[derive(Clone)]
@@ -607,6 +828,9 @@ impl DtlsConnection {
     }
 
     /// Sends application data to the peer.
+    ///
+    /// Returns [`Error::Closed`] if the connection is already closed. Awaits
+    /// when the internal send channel is full (backpressure).
     pub async fn send(&self, data: &[u8]) -> Result<()> {
         self.send_vec(data.to_vec()).await
     }
@@ -639,9 +863,9 @@ impl DtlsConnection {
 
     /// Gracefully closes the connection.
     ///
-    /// Idempotent. Sends `close_notify`, waits for the engine task to finish,
-    /// force-aborts it if it takes longer than the internal close timeout
-    /// (5 s).
+    /// Idempotent. Sends `close_notify`, waits for the engine task to
+    /// finish, and force-aborts it if it takes longer than the internal
+    /// close timeout (5 s).
     pub async fn close(&self) -> Result<()> {
         tracing::debug!("close requested");
 
@@ -678,6 +902,8 @@ impl DtlsConnection {
     }
 
     /// Waits until the connection is fully closed.
+    ///
+    /// Returns immediately if already closed.
     pub async fn wait_closed(&self) {
         let mut rx = self.closed_rx.clone();
         loop {
@@ -717,6 +943,9 @@ impl DtlsConnection {
     }
 
     /// SNI host name sent by the peer, or `None`.
+    ///
+    /// Populated on the **server** side from the client's `server_name`
+    /// extension. Always `None` on the client (SNI is a client-only signal).
     pub fn peer_server_name(&self) -> Option<&str> {
         self.handshake_info.get()?.peer_server_name.as_deref()
     }
@@ -728,17 +957,13 @@ impl DtlsConnection {
     /// - `material` — the raw exported keying material. For SRTP this is
     ///   typically `2 * (key_len + salt_len)` bytes (`60` for AES-CM-128 /
     ///   HMAC-SHA1-80).
-    /// - `profile` — the [`SrtpProfile`] selected via `use_srtp`, which your
-    ///   SRTP stack needs to pick the matching cipher suite.
+    /// - `profile` — the [`SrtpProfile`] selected via `use_srtp`.
     ///
-    /// The method awaits the material's arrival. It resolves immediately if
-    /// the engine has already produced it (usually the case by the time
-    /// `connect*`/`accept*` returns), and returns `None` if the engine exits
-    /// without ever producing it (e.g. `use_srtp` was not negotiated).
-    ///
-    /// The default shared config does not negotiate `use_srtp`; configure
-    /// your `Config` via [`ConfigOptions::dtls_config`] if your SRTP stack
-    /// requires it.
+    /// **Note:** `dimpl13 0.10.2` does not expose a public API to enable
+    /// `use_srtp`, so this method resolves to `None` on the default shared
+    /// config. It is exposed for forward compatibility and for applications
+    /// that inject a custom engine configuration that does negotiate
+    /// `use_srtp`.
     pub async fn keying_material(&self) -> Option<(Vec<u8>, SrtpProfile)> {
         let mut rx = self.km_rx.clone();
         loop {
@@ -782,9 +1007,9 @@ impl DtlsConnection {
         }
     }
 
-    /// Spawn the engine task. Returns the handle and a `ready` oneshot that
-    /// fires with `Ok(())` when the handshake completes, `Err(e)` on failure,
-    /// or is dropped on task termination without ever completing.
+    /// Spawns the engine task. Returns the handle and a `ready` oneshot that
+    /// fires with `Ok(())` when the handshake completes, `Err(e)` on
+    /// failure, or is dropped on task termination without ever completing.
     ///
     /// `on_exit` is dropped (and therefore fires) when the engine task
     /// terminates; used by [`DtlsServer`] for session cleanup.
@@ -864,7 +1089,7 @@ impl DtlsConnection {
 }
 
 // ---------------------------------------------------------------------------
-// DtlsServer — multiplexed single-socket server
+// DtlsServer
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -883,7 +1108,7 @@ struct MuxState {
 }
 
 impl MuxState {
-    /// Remove the session entry only if it still belongs to `id` — protects
+    /// Removes the session entry only if it still belongs to `id` — protects
     /// against a slow-exiting old session clobbering a newly-created one for
     /// the same peer address.
     fn remove_if_matches(&self, peer: SocketAddr, id: u64) {
@@ -898,10 +1123,10 @@ impl MuxState {
 
 /// Multiplexed DTLS 1.3 server: one `UdpSocket`, many connections.
 ///
-/// Incoming datagrams are routed by peer address. Each distinct peer gets its
-/// own [`DtlsConnection`] (own engine, own handshake, own keying material).
-/// When a session ends, its map entry is removed; if the same peer sends a
-/// new `ClientHello`, a fresh session is started.
+/// Incoming datagrams are routed by peer address. Each distinct peer gets
+/// its own [`DtlsConnection`] (own engine, own handshake, own keying
+/// material). When a session ends, its map entry is removed; if the same
+/// peer sends a new `ClientHello`, a fresh session is started.
 ///
 /// # Accept queue
 ///
@@ -913,11 +1138,11 @@ impl MuxState {
 ///
 /// # Shutdown
 ///
-/// Dropping the `DtlsServer` stops the multiplexer task and closes the accept
-/// queue. Already-accepted [`DtlsConnection`] handles keep working; the
-/// shared socket lives as long as at least one of them (or the server) is
-/// alive. Sessions that complete their handshake after the server is dropped
-/// will have their connection dropped and closed.
+/// Dropping the `DtlsServer` stops the multiplexer task and closes the
+/// accept queue. Already-accepted [`DtlsConnection`] handles keep working;
+/// the shared socket lives as long as at least one of them (or the server)
+/// is alive. Sessions that complete their handshake after the server is
+/// dropped will have their connection dropped and closed.
 pub struct DtlsServer {
     state: Arc<MuxState>,
     accept_rx: mpsc::Receiver<DtlsConnection>,
@@ -1132,6 +1357,7 @@ async fn run_engine(
     let mut pending_app: Option<Vec<u8>> = None;
     let mut app_out_pending: VecDeque<Vec<u8>> = VecDeque::new();
     let mut spin_count: u32 = 0;
+    let mut close_requested = false;
 
     tracing::debug!(%peer, is_client, "engine loop starting");
 
@@ -1162,20 +1388,15 @@ async fn run_engine(
             &dropped_app_data,
             &handshake_info,
             &km_tx,
+            &mut close_requested,
         )
         .await
         {
             return Err(report_error(&mut connected_tx, e));
         }
 
-        if connected && connected_tx.is_some() {
-            if let Some(tx) = connected_tx.take() {
-                let _ = tx.send(Ok(()));
-            }
-        }
-
-        if dtls.is_closed() {
-            tracing::debug!(%peer, "engine reports closed");
+        if close_requested {
+            tracing::debug!(%peer, "peer requested close; engine exiting");
             return Ok(());
         }
 
@@ -1203,10 +1424,15 @@ async fn run_engine(
                 &dropped_app_data,
                 &handshake_info,
                 &km_tx,
+                &mut close_requested,
             )
             .await
             {
                 return Err(report_error(&mut connected_tx, e));
+            }
+            if close_requested {
+                tracing::debug!(%peer, "peer requested close (during app data push); exiting");
+                return Ok(());
             }
         }
 
@@ -1226,13 +1452,58 @@ async fn run_engine(
             continue;
         }
 
-        let timer_deadline = next_timeout.unwrap_or_else(|| Instant::now() + SLEEP_MAX);
+        // While the handshake has not completed, cap the wait at the
+        // handshake deadline so an engine that goes silent after a fatal
+        // alert is surfaced as `HandshakeFailed` instead of hanging for
+        // `SLEEP_MAX`.
+        let timer_deadline = match next_timeout {
+            Some(t) if !connected => t.min(handshake_deadline),
+            Some(t) => t,
+            None if !connected => handshake_deadline,
+            None => Instant::now() + SLEEP_MAX,
+        };
 
         tokio::select! {
             biased;
 
             _ = &mut close_rx => {
-                tracing::debug!(%peer, "close requested, sending close_notify");
+                tracing::debug!(%peer, "app requested close; flushing pending app data first");
+
+                // Drain any app data that was queued just before `close()` was
+                // called. Without this, `biased` select ordering (close_rx before
+                // from_handle_rx) means `send(&x).await; close().await` loses `x`.
+                for _ in 0..8 {
+                    if let Err(e) = drain_output(
+                        &mut dtls,
+                        &transport,
+                        peer,
+                        &mut out_buf,
+                        &mut next_timeout,
+                        &validator,
+                        &to_handle_tx,
+                        &mut app_out_pending,
+                        &mut connected,
+                        &mut connected_tx,
+                        &dropped_app_data,
+                        &handshake_info,
+                        &km_tx,
+                        &mut close_requested,
+                    )
+                    .await
+                    {
+                        return Err(report_error(&mut connected_tx, e));
+                    }
+                    match push_app_data(&mut dtls, &mut pending_app, &mut from_handle_rx) {
+                        Ok(0) if pending_app.is_none() => break,
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(%peer, error = %e, "push_app_data failed during close");
+                            break;
+                        }
+                    }
+                }
+
+                tracing::debug!(%peer, "sending close_notify after flush");
                 let _ = dtls.close();
                 let _ = drain_output(
                     &mut dtls,
@@ -1248,23 +1519,28 @@ async fn run_engine(
                     &dropped_app_data,
                     &handshake_info,
                     &km_tx,
-                ).await;
+                    &mut close_requested,
+                )
+                .await;
                 return Ok(());
             }
 
             result = transport.recv(&mut udp_buf) => {
                 let len = match result {
                     Ok(n) => n,
-                    Err(e) => return Err(report_error(&mut connected_tx, Error::Io(e))),
+                    Err(e) => {
+                        tracing::error!(%peer, error = %e, "transport recv failed");
+                        return Err(report_error(&mut connected_tx, Error::Io(e)));
+                    }
                 };
                 if len == udp_buf.len() {
                     tracing::warn!(
                         %peer,
                         buf_len = udp_buf.len(),
-                        "incoming datagram may have been truncated; raise \
-                         ConfigOptions::initial_buffer_size for jumbo MTUs"
+                        "incoming datagram may have been truncated"
                     );
                 }
+                tracing::trace!(%peer, len, "received DTLS record");
                 if let Err(e) = dtls.handle_packet(&udp_buf[..len]) {
                     tracing::error!(%peer, error = ?e, "handle_packet failed");
                     return Err(report_error(&mut connected_tx, Error::Dtls(e)));
@@ -1281,9 +1557,12 @@ async fn run_engine(
 
             maybe = from_handle_rx.recv() => {
                 match maybe {
-                    Some(data) => pending_app = Some(data),
+                    Some(data) => {
+                        tracing::trace!(%peer, len = data.len(), "app data queued for sending");
+                        pending_app = Some(data);
+                    }
                     None => {
-                        tracing::debug!(%peer, "handle dropped, exiting");
+                        tracing::debug!(%peer, "app dropped DtlsConnection; engine exiting");
                         return Ok(());
                     }
                 }
@@ -1311,11 +1590,12 @@ async fn drain_output(
     dropped_app_data: &AtomicU64,
     handshake_info: &OnceLock<HandshakeInfo>,
     km_tx: &watch::Sender<Option<(Vec<u8>, SrtpProfile)>>,
+    close_requested: &mut bool,
 ) -> Result<()> {
     loop {
         match dtls.poll_output(out_buf) {
             Output::Packet(pkt) => {
-                tracing::trace!(len = pkt.len(), "sending DTLS packet");
+                tracing::trace!(%peer, len = pkt.len(), "sending DTLS packet");
                 transport.send(peer, pkt).await?;
             }
             Output::Timeout(t) => {
@@ -1323,7 +1603,7 @@ async fn drain_output(
                 return Ok(());
             }
             Output::Connected => {
-                tracing::debug!("handshake complete");
+                tracing::debug!(%peer, "handshake complete");
                 *connected = true;
                 let _ = handshake_info.set(HandshakeInfo::capture(dtls));
                 if let Some(tx) = connected_tx.take() {
@@ -1331,14 +1611,14 @@ async fn drain_output(
                 }
             }
             Output::PeerCert(der) => {
-                tracing::debug!(cert_len = der.len(), "validating peer certificate");
+                tracing::debug!(%peer, cert_len = der.len(), "validating peer certificate");
                 if !(validator)(der) {
-                    tracing::error!("peer certificate rejected by validator");
+                    tracing::error!(%peer, "peer certificate rejected by validator");
                     return Err(Error::CertRejected);
                 }
             }
             Output::ApplicationData(data) => {
-                tracing::trace!(len = data.len(), "forwarding application data");
+                tracing::trace!(%peer, len = data.len(), "forwarding application data");
                 let msg = data.to_vec();
                 match to_handle_tx.try_send(msg) {
                     Ok(()) => {}
@@ -1346,9 +1626,9 @@ async fn drain_output(
                         if app_out_pending.len() >= MAX_APP_OUT_PENDING {
                             dropped_app_data.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(
+                                %peer,
                                 pending = app_out_pending.len(),
-                                "outbound app queue full; dropping message \
-                                 (consumer too slow)"
+                                "outbound app queue full; dropping message"
                             );
                         } else {
                             app_out_pending.push_back(msg);
@@ -1358,11 +1638,13 @@ async fn drain_output(
                 }
             }
             Output::CloseNotify => {
-                tracing::debug!("peer sent close_notify, responding");
+                tracing::debug!(%peer, "peer sent close_notify; queueing response");
+                *close_requested = true;
                 let _ = dtls.close();
             }
             Output::KeyingMaterial(km, profile) => {
                 tracing::debug!(
+                    %peer,
                     len = km.len(),
                     profile = ?profile,
                     "received keying material"
@@ -1371,12 +1653,12 @@ async fn drain_output(
             }
             Output::BufferTooSmall { needed } => {
                 if out_buf.len() < needed {
-                    tracing::debug!(needed, current = out_buf.len(), "growing out_buf");
+                    tracing::debug!(%peer, needed, current = out_buf.len(), "growing out_buf");
                     out_buf.resize(needed, 0);
                 }
             }
             _ => {
-                tracing::trace!("ignoring unhandled Output variant");
+                tracing::trace!(%peer, "ignoring unhandled Output variant");
             }
         }
     }
@@ -1400,11 +1682,18 @@ fn push_app_data(
         };
         match dtls.send_application_data(&data) {
             Ok(0) => {
+                tracing::trace!("send_application_data returned 0 (backpressure)");
                 *pending_app = Some(data);
                 break;
             }
-            Ok(_n) => pushed += 1,
-            Err(e) => return Err(Error::Dtls(e)),
+            Ok(n) => {
+                tracing::trace!(accepted = n, "send_application_data accepted");
+                pushed += 1;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "send_application_data failed");
+                return Err(Error::Dtls(e));
+            }
         }
     }
     Ok(pushed)
@@ -1433,5 +1722,569 @@ fn report_error(connected_tx: &mut Option<oneshot::Sender<Result<()>>>, err: Err
         Error::TaskFailed(msg)
     } else {
         err
+    }
+}
+
+// ===========================================================================
+// Tests — all tests use loopback (`127.0.0.1`) and never leave the local host.
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use dimpl13::Config;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    use crate::cert::PinnedCertValidator;
+    use crate::{ConfigOptions, DtlsConnection, DtlsServer, Error};
+
+    const T: Duration = Duration::from_secs(5);
+
+    fn tracing_init() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                )
+                .with_test_writer()
+                .try_init();
+        });
+    }
+
+    fn alpn_cfg(protos: &[&[u8]]) -> Arc<Config> {
+        Arc::new(
+            Config::builder()
+                .alpn_protocols(protos)
+                .build()
+                .expect("alpn config"),
+        )
+    }
+
+    async fn connect_to(addr: SocketAddr) -> DtlsConnection {
+        timeout(T, DtlsConnection::connect(&addr.to_string(), |_| true))
+            .await
+            .expect("connect timeout")
+            .expect("connect")
+    }
+
+    async fn spawn_echo_once(
+        opts: ConfigOptions,
+        validator: impl Fn(&[u8]) -> bool + Send + Sync + 'static,
+    ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), Error> {
+        let mut server = DtlsServer::bind("127.0.0.1:0", validator, opts).await?;
+        let addr = server.local_addr();
+        let handle = tokio::spawn(async move {
+            if let Ok(conn) = server.accept().await {
+                loop {
+                    match conn.recv().await {
+                        Ok(msg) => {
+                            if conn.send(&msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        Ok((addr, handle))
+    }
+
+    async fn spawn_echo_multi(
+        opts: ConfigOptions,
+        validator: impl Fn(&[u8]) -> bool + Send + Sync + 'static,
+    ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), Error> {
+        let mut server = DtlsServer::bind("127.0.0.1:0", validator, opts).await?;
+        let addr = server.local_addr();
+        let handle = tokio::spawn(async move {
+            loop {
+                let conn = match server.accept().await {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    loop {
+                        match conn.recv().await {
+                            Ok(msg) => {
+                                if conn.send(&msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        });
+        Ok((addr, handle))
+    }
+
+    // ---- 1. warmup + ConfigOptions defaults ------------------------------
+
+    #[tokio::test]
+    async fn warmup_is_idempotent() {
+        crate::warmup().await.expect("first");
+        crate::warmup().await.expect("second");
+    }
+
+    #[test]
+    fn config_options_defaults() {
+        let o = ConfigOptions::default();
+        assert_eq!(o.handshake_timeout, Duration::from_secs(30));
+        assert_eq!(o.initial_buffer_size, 2048);
+        assert_eq!(o.max_queue_rx, 256);
+        assert_eq!(o.max_queue_tx, 256);
+        assert_eq!(o.channel_capacity, 1024);
+        assert!(o.dtls_config.is_none());
+        assert!(o.dtls_cert.is_none());
+    }
+
+    // ---- 2. Basic connect / echo / close lifecycle -----------------------
+
+    #[tokio::test]
+    async fn basic_connect_echo() {
+        tracing_init();
+        let (addr, _h) = spawn_echo_once(ConfigOptions::default(), |_| true)
+            .await
+            .unwrap();
+        let conn = connect_to(addr).await;
+
+        conn.send(b"hello").await.unwrap();
+        assert_eq!(
+            timeout(T, conn.recv())
+                .await
+                .expect("recv timeout")
+                .unwrap(),
+            b"hello"
+        );
+        let _ = conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn local_and_peer_addr() {
+        tracing_init();
+        let (addr, _h) = spawn_echo_once(ConfigOptions::default(), |_| true)
+            .await
+            .unwrap();
+        let conn = connect_to(addr).await;
+
+        assert_eq!(conn.peer_addr(), addr);
+        assert!(conn.local_addr().is_some());
+
+        let _ = conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn is_closed_lifecycle() {
+        tracing_init();
+        let (addr, _h) = spawn_echo_once(ConfigOptions::default(), |_| true)
+            .await
+            .unwrap();
+        let conn = connect_to(addr).await;
+
+        assert!(!conn.is_closed());
+        assert_eq!(conn.dropped_app_data(), 0);
+
+        conn.close().await.unwrap();
+        assert!(conn.is_closed());
+        conn.wait_closed().await;
+    }
+
+    #[tokio::test]
+    async fn close_is_idempotent() {
+        tracing_init();
+        let (addr, _h) = spawn_echo_once(ConfigOptions::default(), |_| true)
+            .await
+            .unwrap();
+        let conn = connect_to(addr).await;
+
+        conn.close().await.unwrap();
+        conn.close().await.unwrap();
+        assert!(conn.is_closed());
+    }
+
+    #[tokio::test]
+    async fn try_send_after_close() {
+        tracing_init();
+        let (addr, _h) = spawn_echo_once(ConfigOptions::default(), |_| true)
+            .await
+            .unwrap();
+        let conn = connect_to(addr).await;
+
+        conn.close().await.unwrap();
+        match conn.try_send(b"x") {
+            Err(Error::Closed) | Err(Error::ChannelFull) => {}
+            other => panic!("try_send after close: {other:?}"),
+        }
+    }
+
+    // ---- 3. ALPN ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn alpn_negotiation() {
+        tracing_init();
+        let mut opts_s = ConfigOptions::default();
+        opts_s.dtls_config = Some(alpn_cfg(&[b"h2", b"http/1.1"]));
+        let (addr, _h) = spawn_echo_once(opts_s, |_| true).await.unwrap();
+
+        let mut opts_c = ConfigOptions::default();
+        opts_c.dtls_config = Some(alpn_cfg(&[b"h2"]));
+        let conn = timeout(
+            T,
+            DtlsConnection::connect_with(&addr.to_string(), |_| true, opts_c),
+        )
+        .await
+        .expect("timeout")
+        .expect("connect");
+
+        assert_eq!(conn.negotiated_alpn(), Some(b"h2".as_slice()));
+        let _ = conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn alpn_mismatch_rejected() {
+        tracing_init();
+        let mut opts_s = ConfigOptions::default();
+        opts_s.dtls_config = Some(alpn_cfg(&[b"h2"]));
+        let (addr, _h) = spawn_echo_once(opts_s, |_| true).await.unwrap();
+
+        let mut opts_c = ConfigOptions::default();
+        opts_c.dtls_config = Some(alpn_cfg(&[b"http/1.1"]));
+        opts_c.handshake_timeout = Duration::from_secs(3);
+        let res = timeout(
+            T,
+            DtlsConnection::connect_with(&addr.to_string(), |_| true, opts_c),
+        )
+        .await
+        .expect("connect timeout");
+
+        assert!(res.is_err(), "expected ALPN mismatch to fail the handshake");
+    }
+
+    // ---- 4. SNI ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn sni_reported_to_server() {
+        tracing_init();
+        let mut server = DtlsServer::bind("127.0.0.1:0", |_| true, ConfigOptions::default())
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+        let (tx, rx) = oneshot::channel::<Option<String>>();
+        tokio::spawn(async move {
+            if let Ok(conn) = server.accept().await {
+                let _ = tx.send(conn.peer_server_name().map(str::to_owned));
+                let _ = conn.close().await;
+            }
+        });
+
+        let mut opts_c = ConfigOptions::default();
+        opts_c.dtls_config = Some(Arc::new(
+            Config::builder().server_name("test.local").build().unwrap(),
+        ));
+        let conn = timeout(
+            T,
+            DtlsConnection::connect_with(&addr.to_string(), |_| true, opts_c),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(conn.peer_server_name().is_none());
+
+        let seen = timeout(T, rx).await.unwrap().unwrap();
+        assert_eq!(seen.as_deref(), Some("test.local"));
+
+        let _ = conn.close().await;
+    }
+
+    // ---- 5. Connection ID ------------------------------------------------
+
+    #[tokio::test]
+    async fn connection_id_transparent() {
+        tracing_init();
+        let cid: &[u8] = &[0x54, 0x46, 0x54, 0x50, 0x00, 0x01, 0x02, 0x03];
+        let mk = || Arc::new(Config::builder().connection_id(cid).build().unwrap());
+
+        let mut opts_s = ConfigOptions::default();
+        opts_s.dtls_config = Some(mk());
+        let (addr, _h) = spawn_echo_once(opts_s, |_| true).await.unwrap();
+
+        let mut opts_c = ConfigOptions::default();
+        opts_c.dtls_config = Some(mk());
+        let conn = timeout(
+            T,
+            DtlsConnection::connect_with(&addr.to_string(), |_| true, opts_c),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        conn.send(b"cid-payload").await.unwrap();
+        assert_eq!(
+            timeout(T, conn.recv()).await.unwrap().unwrap(),
+            b"cid-payload"
+        );
+        let _ = conn.close().await;
+    }
+
+    // ---- 6. Record Size Limit -------------------------------------------
+
+    #[tokio::test]
+    async fn record_size_limit_transparent() {
+        tracing_init();
+        let mk = || Arc::new(Config::builder().record_size_limit(1200).build().unwrap());
+
+        let mut opts_s = ConfigOptions::default();
+        opts_s.dtls_config = Some(mk());
+        let (addr, _h) = spawn_echo_once(opts_s, |_| true).await.unwrap();
+
+        let mut opts_c = ConfigOptions::default();
+        opts_c.dtls_config = Some(mk());
+        let conn = timeout(
+            T,
+            DtlsConnection::connect_with(&addr.to_string(), |_| true, opts_c),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let payload = vec![0xABu8; 800];
+        conn.send(&payload).await.unwrap();
+        assert_eq!(timeout(T, conn.recv()).await.unwrap().unwrap(), payload);
+        let _ = conn.close().await;
+    }
+
+    // ---- 7. SRTP keying material (smoke) --------------------------------
+    //
+    // `dimpl13 0.10.2` does not expose a public API to configure SRTP
+    // profiles. The `keying_material()` future is therefore only checked for
+    // not panicking; if the engine does not negotiate `use_srtp`, it returns
+    // `None`, which is acceptable.
+
+    #[tokio::test]
+    async fn srtp_keying_material_smoke() {
+        tracing_init();
+        let (addr, _h) = spawn_echo_once(ConfigOptions::default(), |_| true)
+            .await
+            .unwrap();
+        let conn = connect_to(addr).await;
+
+        let km = timeout(T, conn.keying_material()).await;
+        assert!(km.is_ok(), "keying_material() must not hang");
+
+        // Either `Some((material, profile))` or `None` is valid depending on
+        // whether SRTP was negotiated. Both sides must agree when present.
+        if let Some((material, _profile)) = km.unwrap() {
+            assert!(!material.is_empty(), "keying material must not be empty");
+        }
+
+        let _ = conn.close().await;
+    }
+
+    // ---- 8. Multiplexing -------------------------------------------------
+
+    #[tokio::test]
+    async fn multiplex_three_concurrent_peers() {
+        tracing_init();
+        let (addr, _h) = spawn_echo_multi(ConfigOptions::default(), |_| true)
+            .await
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0u8..3 {
+            let addr = addr.to_string();
+            handles.push(tokio::spawn(async move {
+                let conn = timeout(T, DtlsConnection::connect(&addr, |_| true))
+                    .await
+                    .expect("connect timeout")
+                    .expect("connect");
+                let msg = vec![i; 64];
+                conn.send(&msg).await.unwrap();
+                let got = timeout(T, conn.recv()).await.expect("recv").unwrap();
+                assert_eq!(got, msg);
+                let _ = conn.close().await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn session_count_tracks_peers() {
+        tracing_init();
+        let mut server = DtlsServer::bind("127.0.0.1:0", |_| true, ConfigOptions::default())
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+
+        assert_eq!(server.session_count(), 0);
+
+        let client = connect_to(addr).await;
+        let srv_conn = timeout(T, server.accept()).await.unwrap().unwrap();
+
+        assert!(
+            server.session_count() >= 1,
+            "expected >= 1 session after accept, got {}",
+            server.session_count()
+        );
+
+        let _ = srv_conn.close().await;
+        let _ = client.close().await;
+    }
+
+    // ---- 9. Error cases --------------------------------------------------
+
+    #[tokio::test]
+    async fn invalid_server_address() {
+        let res = DtlsConnection::connect("not-a-socket-addr", |_| true).await;
+        assert!(matches!(res, Err(Error::InvalidAddress)));
+    }
+
+    #[tokio::test]
+    async fn cert_rejected_by_validator() {
+        tracing_init();
+        let (addr, _h) = spawn_echo_once(ConfigOptions::default(), |_| true)
+            .await
+            .unwrap();
+        let res = timeout(T, DtlsConnection::connect(&addr.to_string(), |_der| false))
+            .await
+            .expect("connect timeout");
+
+        assert!(matches!(res, Err(Error::CertRejected)));
+    }
+
+    // ---- 10. Pinned certificate validation -------------------------------
+
+    #[tokio::test]
+    async fn pinned_cert_accepts_matching() {
+        tracing_init();
+        let cert = dimpl13::certificate::generate_self_signed_certificate().expect("generate cert");
+        let pin = PinnedCertValidator::new(&cert.certificate);
+
+        let mut opts_s = ConfigOptions::default();
+        opts_s.dtls_cert = Some(Arc::new(cert));
+        let (addr, _h) = spawn_echo_once(opts_s, |_| true).await.unwrap();
+
+        let conn = timeout(
+            T,
+            DtlsConnection::connect_with(
+                &addr.to_string(),
+                move |der: &[u8]| pin.verify(der),
+                ConfigOptions::default(),
+            ),
+        )
+        .await
+        .expect("connect timeout")
+        .expect("connect");
+
+        conn.send(b"pinned").await.unwrap();
+        assert_eq!(timeout(T, conn.recv()).await.unwrap().unwrap(), b"pinned");
+        let _ = conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn pinned_cert_rejects_mismatch() {
+        tracing_init();
+        let other =
+            dimpl13::certificate::generate_self_signed_certificate().expect("generate other");
+        let pin = PinnedCertValidator::new(&other.certificate);
+
+        let (addr, _h) = spawn_echo_once(ConfigOptions::default(), |_| true)
+            .await
+            .unwrap();
+
+        let res = timeout(
+            T,
+            DtlsConnection::connect_with(
+                &addr.to_string(),
+                move |der: &[u8]| pin.verify(der),
+                ConfigOptions::default(),
+            ),
+        )
+        .await
+        .expect("connect timeout");
+
+        assert!(matches!(res, Err(Error::CertRejected)));
+    }
+
+    // ---- 11. WebPKI (feature-gated) -------------------------------------
+
+    #[cfg(feature = "webpki")]
+    mod webpki_ext {
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        use rustls_pki_types::ServerName;
+
+        use crate::webpki::WebPkiVerifier;
+
+        /// Builds a self-signed CA and returns it as a `CertifiedIssuer`
+        /// that can sign leaf certificates.
+        fn make_ca() -> CertifiedIssuer<'static, KeyPair> {
+            let key = KeyPair::generate().expect("ca key");
+            let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            // `CertifiedIssuer::self_signed` produces both the certificate
+            // and the issuer wrapper.
+            CertifiedIssuer::self_signed(params, key).expect("ca cert")
+        }
+
+        /// Builds a leaf certificate signed by the given `issuer`.
+        fn make_leaf(issuer: &CertifiedIssuer<'_, KeyPair>, name: &str) -> Vec<u8> {
+            let key = KeyPair::generate().expect("leaf key");
+            let params = CertificateParams::new(vec![name.to_string()]).expect("leaf params");
+            // `signed_by` takes the leaf key and a reference to the issuer
+            // (which bundles the CA certificate and its signing key).
+            let cert = params.signed_by(&key, issuer).expect("leaf cert");
+            cert.der().to_vec()
+        }
+
+        #[test]
+        fn accepts_leaf_from_trusted_ca() {
+            let ca = make_ca();
+            let leaf = make_leaf(&ca, "test.local");
+            let v = WebPkiVerifier::builder()
+                .trust_anchor_der(ca.der().to_vec())
+                .build()
+                .expect("build");
+            v.verify(&leaf).expect("leaf must verify");
+        }
+
+        #[test]
+        fn rejects_unknown_ca() {
+            let ca_a = make_ca();
+            let ca_b = make_ca();
+            let leaf = make_leaf(&ca_b, "test.local");
+
+            let v = WebPkiVerifier::builder()
+                .trust_anchor_der(ca_a.der().to_vec())
+                .build()
+                .expect("build");
+            assert!(v.verify(&leaf).is_err(), "leaf must be rejected");
+        }
+
+        #[test]
+        fn rejects_name_mismatch() {
+            let ca = make_ca();
+            let leaf = make_leaf(&ca, "good.local");
+            let name: ServerName<'static> = "other.local".try_into().unwrap();
+            let v = WebPkiVerifier::builder()
+                .trust_anchor_der(ca.der().to_vec())
+                .with_server_name(name)
+                .build()
+                .expect("build");
+            assert!(v.verify(&leaf).is_err(), "name must mismatch");
+        }
+
+        #[test]
+        fn empty_builder_fails() {
+            assert!(WebPkiVerifier::builder().build().is_err());
+        }
     }
 }

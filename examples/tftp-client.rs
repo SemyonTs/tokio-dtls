@@ -8,6 +8,8 @@
 //! ```sh
 //! cargo run --example tftp-client -- 127.0.0.1:6969 README.md file2.bin
 //! ```
+//!
+//! `RUST_LOG=tokio_dtls=debug` for per-session tracing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +33,8 @@ const DEFAULT_BLOCK: usize = 512;
 const REQUEST_BLOCK: usize = 1024;
 const REQUEST_TIMEOUT_S: u64 = 5;
 
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
+const RECV_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn build_config() -> Arc<dimpl13::Config> {
     Arc::new(
@@ -67,9 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         data.len()
                     );
                     let out = format!("received_{}", filename.replace(['/', '\\'], "_"));
-                    match std::fs::write(&out, &data) {
+                    match tokio::fs::write(&out, &data).await {
                         Ok(()) => println!("[{filename}] saved to {out}"),
-                        Err(e) => eprintln!("[{filename}] write failed: {e}"),
+                        Err(e) => eprintln!("[{filename}] write {out}: {e}"),
                     }
                 }
                 Err(e) => eprintln!("[{filename}] failed: {e}"),
@@ -89,13 +92,18 @@ async fn fetch_one(server: &str, filename: &str) -> Result<(Vec<u8>, usize), Str
             dimpl13::certificate::generate_self_signed_certificate()
                 .map_err(|e| format!("cert: {e}"))?,
         )),
+        handshake_timeout: CONNECT_TIMEOUT,
         ..Default::default()
     };
-    let conn = DtlsConnection::connect_with(server, |_der| true, opts)
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
+    let conn = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        DtlsConnection::connect_with(server, |_der| true, opts),
+    )
+    .await
+    .map_err(|_| format!("connect timeout to {server}"))?
+    .map_err(|e| format!("connect: {e}"))?;
 
-    // Build and send RRQ with options.
+    // ---- Send RRQ with options ----
     let mut rrq = Vec::new();
     rrq.extend_from_slice(&OP_RRQ.to_be_bytes());
     rrq.extend_from_slice(filename.as_bytes());
@@ -118,19 +126,12 @@ async fn fetch_one(server: &str, filename: &str) -> Result<(Vec<u8>, usize), Str
     let mut received: Vec<u8> = Vec::new();
     let mut done = false;
 
-    // First response: OACK, DATA (block 1), or ERROR.
+    // ---- First response: OACK, DATA (block 1), or ERROR ----
     loop {
-        let pkt = match tokio::time::timeout(OVERALL_TIMEOUT, conn.recv()).await {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                let _ = conn.close().await;
-                return Err(format!("recv: {e}"));
-            }
-            Err(_) => {
-                let _ = conn.close().await;
-                return Err("timeout waiting for first response".into());
-            }
-        };
+        let pkt = tokio::time::timeout(RECV_TIMEOUT, conn.recv())
+            .await
+            .map_err(|_| "timeout waiting for first response".to_string())?
+            .map_err(|e| format!("recv: {e}"))?;
         if pkt.len() < 4 {
             continue;
         }
@@ -147,9 +148,7 @@ async fn fetch_one(server: &str, filename: &str) -> Result<(Vec<u8>, usize), Str
                         }
                     }
                 }
-                let mut ack = Vec::with_capacity(4);
-                ack.extend_from_slice(&OP_ACK.to_be_bytes());
-                ack.extend_from_slice(&0u16.to_be_bytes());
+                let ack = [OP_ACK.to_be_bytes(), 0u16.to_be_bytes()].concat();
                 conn.send(&ack).await.map_err(|e| format!("ACK 0: {e}"))?;
                 break;
             }
@@ -160,9 +159,7 @@ async fn fetch_one(server: &str, filename: &str) -> Result<(Vec<u8>, usize), Str
                 }
                 received.extend_from_slice(&pkt[4..]);
                 let is_last = pkt.len() < 4 + blksize;
-                let mut ack = Vec::with_capacity(4);
-                ack.extend_from_slice(&OP_ACK.to_be_bytes());
-                ack.extend_from_slice(&1u16.to_be_bytes());
+                let ack = [OP_ACK.to_be_bytes(), 1u16.to_be_bytes()].concat();
                 conn.send(&ack).await.map_err(|e| format!("ACK 1: {e}"))?;
                 if is_last {
                     done = true;
@@ -181,18 +178,12 @@ async fn fetch_one(server: &str, filename: &str) -> Result<(Vec<u8>, usize), Str
         }
     }
 
+    // ---- Remaining DATA blocks ----
     while !done {
-        let pkt = match tokio::time::timeout(OVERALL_TIMEOUT, conn.recv()).await {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                let _ = conn.close().await;
-                return Err(format!("recv: {e}"));
-            }
-            Err(_) => {
-                let _ = conn.close().await;
-                return Err(format!("timeout waiting for block {expected_block}"));
-            }
-        };
+        let pkt = tokio::time::timeout(RECV_TIMEOUT, conn.recv())
+            .await
+            .map_err(|_| format!("timeout waiting for block {expected_block}"))?
+            .map_err(|e| format!("recv: {e}"))?;
         if pkt.len() < 4 {
             continue;
         }
@@ -210,14 +201,10 @@ async fn fetch_one(server: &str, filename: &str) -> Result<(Vec<u8>, usize), Str
                 }
                 received.extend_from_slice(&pkt[4..]);
                 let is_last = pkt.len() < 4 + blksize;
-
-                let mut ack = Vec::with_capacity(4);
-                ack.extend_from_slice(&OP_ACK.to_be_bytes());
-                ack.extend_from_slice(&block.to_be_bytes());
+                let ack = [OP_ACK.to_be_bytes(), block.to_be_bytes()].concat();
                 conn.send(&ack)
                     .await
                     .map_err(|e| format!("ACK {block}: {e}"))?;
-
                 if is_last {
                     done = true;
                 } else {

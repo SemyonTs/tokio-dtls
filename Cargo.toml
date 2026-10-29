@@ -1,6 +1,6 @@
 [package]
 name = "tokio-dtls"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Async DTLS 1.3 for Tokio, powered by dimpl13"
@@ -13,8 +13,30 @@ categories = ["network-programming", "cryptography"]
 [lib]
 path = "lib.rs"
 
+[features]
+default = []
+webpki = [
+    "dep:rustls_webpki",
+    "dep:rustls-pki-types",
+    "dep:rustls-pemfile",
+    "dep:webpki-roots",
+]
+
 [dependencies]
 dimpl13 = { version = "0.10.2", features = ["rcgen"] }
 tokio = { version = "1", features = ["net", "time", "sync", "macros", "rt", "rt-multi-thread"] }
 thiserror = "2"
 tracing = "0.1"
+
+# The package on crates.io is `rustls-webpki`, but its lib name is `webpki`.
+# We rename the dependency key to `rustls_webpki` so the source can keep
+# `use rustls_webpki::...` — otherwise we would have to write `use webpki::...`.
+rustls_webpki = { package = "rustls-webpki", version = "0.103", optional = true, default-features = false, features = ["alloc", "std", "ring"] }
+rustls-pki-types = { version = "1", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+rcgen = "=0.14.7"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["fs"] }

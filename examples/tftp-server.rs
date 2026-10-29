@@ -5,6 +5,8 @@
 //! ```sh
 //! cargo run --example tftp-server -- 127.0.0.1:6969 ./public
 //! ```
+//!
+//! `RUST_LOG=tokio_dtls=debug` for per-session tracing.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +30,7 @@ const OP_OACK: u16 = 6;
 const DEFAULT_BLOCK: usize = 512;
 const MAX_BLOCK: usize = 1024; // must stay under RSL − DTLS overhead
 const DEFAULT_TIMEOUT_S: u64 = 5;
+const RRQ_TIMEOUT_S: u64 = 10;
 
 const ERR_NOT_FOUND: u16 = 1;
 const ERR_ACCESS: u16 = 2;
@@ -41,18 +44,22 @@ fn build_config() -> Arc<dimpl13::Config> {
             .server_name(SNI)
             .connection_id(CID)
             .record_size_limit(RSL)
-            // The client also uses `require_client_certificate = true`; leaving
-            // the default makes both sides negotiate client auth, which the
-            // demo accepts via `|_der| true`.
             .build()
             .expect("valid TFTP config"),
     )
 }
 
-// ---------- Entry point ----------
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Tracing to stderr; controlled by RUST_LOG.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("tokio_dtls=debug")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let mut args = std::env::args().skip(1);
     let bind_addr = args.next().unwrap_or_else(|| "127.0.0.1:6969".into());
     let root = PathBuf::from(args.next().unwrap_or_else(|| ".".into()));
@@ -74,15 +81,15 @@ async fn serve(bind_addr: &str, root: PathBuf) -> Result<(), Box<dyn std::error:
     );
 
     let opts = ConfigOptions {
-        dtls_config: Some(Arc::clone(&config)),
-        dtls_cert: Some(Arc::clone(&cert)),
+        dtls_config: Some(config),
+        dtls_cert: Some(cert),
         handshake_timeout: Duration::from_secs(15),
         ..Default::default()
     };
 
     let mut server = DtlsServer::bind(bind_addr, |_der| true, opts).await?;
     println!(
-        "TFTP server (multiplexed) on {}, root = {}",
+        "TFTP server (multiplexed) on {} root={}",
         server.local_addr(),
         root.display()
     );
@@ -102,7 +109,7 @@ async fn serve(bind_addr: &str, root: PathBuf) -> Result<(), Box<dyn std::error:
         let root = root.clone();
 
         tokio::spawn(async move {
-            println!("--- session peer={peer} (active sessions: {active}) ---");
+            println!("--- session peer={peer} active={active} ---");
             if let Some(p) = conn.negotiated_alpn() {
                 println!("  ALPN: {}", String::from_utf8_lossy(p));
             }
@@ -116,45 +123,59 @@ async fn serve(bind_addr: &str, root: PathBuf) -> Result<(), Box<dyn std::error:
     }
 }
 
-// ---------- TFTP session ----------
+// ---------------------------------------------------------------------------
+// Session handler
+// ---------------------------------------------------------------------------
 
 async fn handle_session(
     conn: &DtlsConnection,
     root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // ---- Receive RRQ ----
-    let request = match tokio::time::timeout(Duration::from_secs(10), conn.recv()).await {
+    // ---- 1. Receive RRQ ----
+    let request = match tokio::time::timeout(Duration::from_secs(RRQ_TIMEOUT_S), conn.recv()).await
+    {
         Ok(Ok(d)) => d,
-        Ok(Err(e)) => return Err(e.into()),
+        Ok(Err(e)) => {
+            eprintln!("recv RRQ: {e}");
+            return Err(format!("recv RRQ: {e}").into());
+        }
         Err(_) => {
-            eprintln!("no RRQ within 10s, closing");
+            eprintln!("no RRQ within {RRQ_TIMEOUT_S}s, closing");
             let _ = conn.close().await;
             return Ok(());
         }
     };
 
     if request.len() < 4 || u16::from_be_bytes([request[0], request[1]]) != OP_RRQ {
-        let _ = send_error(conn, ERR_ILLEGAL, "expected RRQ").await;
+        eprintln!("malformed RRQ (len={})", request.len());
+        send_error(conn, ERR_ILLEGAL, "expected RRQ").await;
         return Ok(());
     }
 
+    // ---- 2. Parse filename + mode ----
     let mut parts = request[2..].split(|&b| b == 0);
-    let filename = parts.next().filter(|f| !f.is_empty());
-    let mode = parts.next();
-    let Some(filename) = filename else {
-        let _ = send_error(conn, ERR_ILLEGAL, "missing filename").await;
+    let Some(filename_raw) = parts.next() else {
+        eprintln!("RRQ missing filename");
+        send_error(conn, ERR_ILLEGAL, "missing filename").await;
         return Ok(());
     };
-    let filename = String::from_utf8_lossy(filename).into_owned();
-    let mode = mode
+    if filename_raw.is_empty() {
+        eprintln!("RRQ filename is empty");
+        send_error(conn, ERR_ILLEGAL, "missing filename").await;
+        return Ok(());
+    }
+    let filename = String::from_utf8_lossy(filename_raw).into_owned();
+    let mode = parts
+        .next()
         .map(|m| String::from_utf8_lossy(m).into_owned())
         .unwrap_or_default();
     if !mode.eq_ignore_ascii_case("octet") {
-        let _ = send_error(conn, ERR_ILLEGAL, "only octet mode supported").await;
+        eprintln!("RRQ {filename}: unsupported mode {mode:?}");
+        send_error(conn, ERR_ILLEGAL, "only octet mode supported").await;
         return Ok(());
     }
 
-    // Options: alternating key\0value\0
+    // ---- 3. Parse options (alternating key\0value\0) ----
     let mut opts = Vec::new();
     loop {
         let Some(k) = parts.next() else { break };
@@ -162,31 +183,46 @@ async fn handle_session(
             break;
         }
         let Some(v) = parts.next() else {
-            let _ = send_error(conn, ERR_OPT, "missing option value").await;
+            eprintln!("RRQ {filename}: option {k:?} missing value");
+            send_error(conn, ERR_OPT, "missing option value").await;
             return Ok(());
         };
-        let k = String::from_utf8_lossy(k).to_ascii_lowercase();
-        let v = String::from_utf8_lossy(v).into_owned();
-        opts.push((k, v));
+        opts.push((
+            String::from_utf8_lossy(k).to_ascii_lowercase(),
+            String::from_utf8_lossy(v).into_owned(),
+        ));
     }
 
-    // ---- Resolve path inside root ----
-    let Some(path) = safe_join(root, &filename) else {
-        let _ = send_error(conn, ERR_ACCESS, "path traversal denied").await;
-        return Ok(());
-    };
-    let data = match std::fs::read(&path) {
-        Ok(d) => d,
-        Err(_) => {
-            let _ = send_error(conn, ERR_NOT_FOUND, "file not found").await;
+    eprintln!("RRQ filename={filename} mode={mode} opts={opts:?}");
+
+    // ---- 4. Resolve path inside root ----
+    let path = match safe_join(root, &filename) {
+        JoinOutcome::Ok(p) => p,
+        JoinOutcome::Traversal => {
+            eprintln!("RRQ {filename}: path traversal denied");
+            send_error(conn, ERR_ACCESS, "path traversal denied").await;
+            return Ok(());
+        }
+        JoinOutcome::NotFound => {
+            eprintln!("RRQ {filename}: file not found");
+            send_error(conn, ERR_NOT_FOUND, "file not found").await;
             return Ok(());
         }
     };
 
-    // ---- Option negotiation ----
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("read {} failed: {e}", path.display());
+            send_error(conn, ERR_NOT_FOUND, "file read failed").await;
+            return Ok(());
+        }
+    };
+
+    // ---- 5. Option negotiation ----
     let mut blksize = DEFAULT_BLOCK;
     let mut timeout_s = DEFAULT_TIMEOUT_S;
-    let mut accepted: Vec<(&str, String)> = Vec::new();
+    let mut accepted: Vec<(&'static str, String)> = Vec::new();
 
     for (k, v) in &opts {
         match k.as_str() {
@@ -204,15 +240,12 @@ async fn handle_session(
                     accepted.push(("timeout", n.to_string()));
                 }
             }
-            "tsize" => {
-                accepted.push(("tsize", data.len().to_string()));
-            }
-            _ => { /* ignore unknown */ }
+            "tsize" => accepted.push(("tsize", data.len().to_string())),
+            _ => {}
         }
     }
 
     if !accepted.is_empty() {
-        // OACK
         let mut oack = Vec::new();
         oack.extend_from_slice(&OP_OACK.to_be_bytes());
         for (k, v) in &accepted {
@@ -221,33 +254,54 @@ async fn handle_session(
             oack.extend_from_slice(v.as_bytes());
             oack.push(0);
         }
-        conn.send(&oack).await?;
-        // Wait for ACK 0
-        let ack = tokio::time::timeout(Duration::from_secs(timeout_s), conn.recv()).await;
-        match ack {
-            Ok(Ok(a))
-                if a.len() >= 4
-                    && u16::from_be_bytes([a[0], a[1]]) == OP_ACK
-                    && u16::from_be_bytes([a[2], a[3]]) == 0 => {}
-            _ => {
-                let _ = send_error(conn, ERR_ILLEGAL, "OACK not acked").await;
+        conn.send(&oack)
+            .await
+            .map_err(|e| format!("send OACK: {e}"))?;
+
+        // Wait for ACK block 0.
+        let result = tokio::time::timeout(Duration::from_secs(timeout_s), conn.recv()).await;
+        match result {
+            Ok(Ok(ack))
+                if ack.len() >= 4
+                    && u16::from_be_bytes([ack[0], ack[1]]) == OP_ACK
+                    && u16::from_be_bytes([ack[2], ack[3]]) == 0 => {}
+            Ok(Ok(ack)) => {
+                eprintln!(
+                    "RRQ {filename}: expected ACK 0, got op={} block={}",
+                    if ack.len() >= 2 {
+                        u16::from_be_bytes([ack[0], ack[1]])
+                    } else {
+                        0
+                    },
+                    if ack.len() >= 4 {
+                        u16::from_be_bytes([ack[2], ack[3]])
+                    } else {
+                        0
+                    },
+                );
+                send_error(conn, ERR_ILLEGAL, "OACK not acked").await;
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                eprintln!("RRQ {filename}: recv ACK0: {e}");
+                return Err(format!("recv ACK0: {e}").into());
+            }
+            Err(_) => {
+                eprintln!("RRQ {filename}: timeout waiting for ACK 0");
+                send_error(conn, ERR_ILLEGAL, "OACK not acked").await;
                 return Ok(());
             }
         }
     }
 
-    // ---- Data transfer ----
-    println!(
-        "RRQ {} → {} bytes, blksize={}, timeout={}s",
-        filename,
-        data.len(),
-        blksize,
-        timeout_s
+    eprintln!(
+        "RRQ {filename} -> {} bytes, blksize={blksize}, timeout={timeout_s}s",
+        data.len()
     );
 
+    // ---- 6. Data transfer ----
     let mut block: u16 = 1;
     let mut offset = 0usize;
-
     loop {
         let end = (offset + blksize).min(data.len());
         let chunk = &data[offset..end];
@@ -257,11 +311,14 @@ async fn handle_session(
         pkt.extend_from_slice(&block.to_be_bytes());
         pkt.extend_from_slice(chunk);
 
-        conn.send(&pkt).await?;
-
         let mut acked = false;
         for attempt in 0..3u32 {
-            match tokio::time::timeout(Duration::from_secs(timeout_s), conn.recv()).await {
+            conn.send(&pkt)
+                .await
+                .map_err(|e| format!("send DATA {block}: {e}"))?;
+
+            let result = tokio::time::timeout(Duration::from_secs(timeout_s), conn.recv()).await;
+            match result {
                 Ok(Ok(ack)) if ack.len() >= 4 => {
                     if u16::from_be_bytes([ack[0], ack[1]]) == OP_ACK
                         && u16::from_be_bytes([ack[2], ack[3]]) == block
@@ -269,18 +326,33 @@ async fn handle_session(
                         acked = true;
                         break;
                     }
+                    eprintln!(
+                        "  block {block}: unexpected reply (len={}, op={})",
+                        ack.len(),
+                        if ack.len() >= 2 {
+                            u16::from_be_bytes([ack[0], ack[1]])
+                        } else {
+                            0
+                        },
+                    );
                 }
-                Ok(Err(e)) => return Err(e.into()),
-                _ => {
+                Ok(Ok(ack)) => {
+                    eprintln!("  block {block}: short reply (len={})", ack.len());
+                }
+                Ok(Err(e)) => {
+                    eprintln!("  block {block}: recv error: {e}");
+                    return Err(format!("recv ACK {block}: {e}").into());
+                }
+                Err(_) => {
                     if attempt < 2 {
-                        println!("  block {block} timeout, retransmitting");
-                        conn.send(&pkt).await?;
+                        eprintln!("  block {block} timeout, retransmitting");
                     }
                 }
             }
         }
         if !acked {
-            let _ = send_error(conn, ERR_ILLEGAL, "ACK timeout").await;
+            eprintln!("  block {block}: ACK timeout, aborting");
+            send_error(conn, ERR_ILLEGAL, "ACK timeout").await;
             return Ok(());
         }
 
@@ -291,41 +363,53 @@ async fn handle_session(
         block = block.wrapping_add(1);
     }
 
-    println!("  transfer complete");
+    eprintln!("  transfer complete");
     let _ = conn.close().await;
     Ok(())
 }
 
-fn safe_join(root: &Path, name: &str) -> Option<PathBuf> {
+// ---------------------------------------------------------------------------
+// Path resolution
+// ---------------------------------------------------------------------------
+
+enum JoinOutcome {
+    Ok(PathBuf),
+    NotFound,
+    Traversal,
+}
+
+fn safe_join(root: &Path, name: &str) -> JoinOutcome {
     let p = Path::new(name);
     if p.is_absolute() {
-        return None;
+        return JoinOutcome::Traversal;
     }
     for comp in p.components() {
         use std::path::Component::*;
         if matches!(comp, ParentDir | RootDir | Prefix(_)) {
-            return None;
+            return JoinOutcome::Traversal;
         }
     }
     let joined = root.join(p);
-    let canon = joined.canonicalize().ok()?;
-    if !canon.starts_with(root) {
-        return None;
+    match joined.canonicalize() {
+        Ok(canon) if canon.starts_with(root) => JoinOutcome::Ok(canon),
+        Ok(_) => JoinOutcome::Traversal,
+        Err(_) => JoinOutcome::NotFound,
     }
-    Some(canon)
 }
 
-async fn send_error(
-    conn: &DtlsConnection,
-    code: u16,
-    msg: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+// ---------------------------------------------------------------------------
+// ERROR packet
+// ---------------------------------------------------------------------------
+
+async fn send_error(conn: &DtlsConnection, code: u16, msg: &str) {
+    eprintln!("SEND ERROR code={code} msg={msg}");
     let mut p = Vec::with_capacity(4 + msg.len() + 1);
     p.extend_from_slice(&OP_ERROR.to_be_bytes());
     p.extend_from_slice(&code.to_be_bytes());
     p.extend_from_slice(msg.as_bytes());
     p.push(0);
-    conn.send(&p).await?;
+    if let Err(e) = conn.send(&p).await {
+        eprintln!("send ERROR failed: {e}");
+    }
     let _ = conn.close().await;
-    Ok(())
 }
