@@ -55,24 +55,25 @@
 //!
 //! ## Keying material (DTLS-SRTP)
 //!
-//! [`dimpl13`] emits `Output::KeyingMaterial(material, profile)`
-//! (RFC 5764 / RFC 7714) for use with an SRTP stack. This crate forwards
-//! that variant and exposes it via [`DtlsConnection::keying_material`].
+//! `dimpl13` advertises SRTP (`use_srtp`) with all supported profiles
+//! ([`SrtpProfile::ALL`]) by default and emits
+//! `Output::KeyingMaterial(material, profile)` (RFC 5764 / RFC 7714) after
+//! a handshake in which SRTP was negotiated. This crate forwards that
+//! variant and exposes it via [`DtlsConnection::keying_material`].
 //!
-//! **Note:** `dimpl13 0.10.2` does not expose a public API to enable
-//! `use_srtp`. Unless a custom engine configuration is injected through a
-//! future `dimpl13` version, `Output::KeyingMaterial` is never produced and
-//! [`keying_material`](DtlsConnection::keying_material) resolves to `None`.
-//! The method is exposed for forward compatibility and for applications
-//! built on top of a newer engine or a custom build that does negotiate
-//! `use_srtp`.
+//! - `material` length depends on the profile: 60 bytes for
+//!   `SrtpProfile::AES128_CM_SHA1_80`, 56 for `SrtpProfile::AEAD_AES_128_GCM`,
+//!   88 for `SrtpProfile::AEAD_AES_256_GCM`.
+//! - `profile` is re-exported as [`SrtpProfile`] so callers do not need a
+//!   direct `dimpl13` dependency.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! # use tokio_dtls::DtlsConnection;
 //! let conn = DtlsConnection::connect("127.0.0.1:4433", |_| true).await?;
 //! if let Some((material, profile)) = conn.keying_material().await {
-//!     println!("SRTP profile: {:?}, {} bytes", profile, material.len());
+//!     println!("SRTP profile: {profile:?}, {} bytes", material.len());
+//!     // feed `material` + `profile` into your SRTP stack
 //! }
 //! # Ok(())
 //! # }
@@ -541,8 +542,8 @@ pub struct ConfigOptions {
     /// - `.connection_id(&[0xAA, 0xBB])`
     /// - `.record_size_limit(1200)`
     ///
-    /// SRTP (`use_srtp`) is not yet configurable through `dimpl13 0.10.2`'s
-    /// public `ConfigBuilder`; see [`DtlsConnection::keying_material`].
+    /// SRTP (`use_srtp`) is enabled by `dimpl13` by default; see
+    /// [`DtlsConnection::keying_material`].
     pub dtls_config: Option<Arc<Config>>,
 
     /// Pre-generated certificate. `None` = use the process-wide shared
@@ -954,16 +955,20 @@ impl DtlsConnection {
     ///
     /// Returns `(material, profile)`:
     ///
-    /// - `material` — the raw exported keying material. For SRTP this is
-    ///   typically `2 * (key_len + salt_len)` bytes (`60` for AES-CM-128 /
-    ///   HMAC-SHA1-80).
+    /// - `material` — the raw exported keying material. Length depends on the
+    ///   selected profile: 60 bytes for `SrtpProfile::AES128_CM_SHA1_80`,
+    ///   56 for `SrtpProfile::AEAD_AES_128_GCM`, 88 for
+    ///   `SrtpProfile::AEAD_AES_256_GCM`.
     /// - `profile` — the [`SrtpProfile`] selected via `use_srtp`.
     ///
-    /// **Note:** `dimpl13 0.10.2` does not expose a public API to enable
-    /// `use_srtp`, so this method resolves to `None` on the default shared
-    /// config. It is exposed for forward compatibility and for applications
-    /// that inject a custom engine configuration that does negotiate
-    /// `use_srtp`.
+    /// `dimpl13` advertises SRTP (`use_srtp`) with `SrtpProfile::ALL` by
+    /// default, so on the default shared config this method resolves to
+    /// `Some((material, profile))` as soon as the handshake completes
+    /// against a peer that also supports SRTP.
+    ///
+    /// Returns `None` only when the peer did not negotiate `use_srtp`
+    /// (e.g. a non-WebRTC peer that ignored the extension), or when the
+    /// engine exits without producing it.
     pub async fn keying_material(&self) -> Option<(Vec<u8>, SrtpProfile)> {
         let mut rx = self.km_rx.clone();
         loop {
@@ -2061,29 +2066,51 @@ mod tests {
         let _ = conn.close().await;
     }
 
-    // ---- 7. SRTP keying material (smoke) --------------------------------
-    //
-    // `dimpl13 0.10.2` does not expose a public API to configure SRTP
-    // profiles. The `keying_material()` future is therefore only checked for
-    // not panicking; if the engine does not negotiate `use_srtp`, it returns
-    // `None`, which is acceptable.
+    // ---- 7. SRTP keying material ----------------------------------------
 
     #[tokio::test]
-    async fn srtp_keying_material_smoke() {
+    async fn srtp_keying_material_matches() {
         tracing_init();
-        let (addr, _h) = spawn_echo_once(ConfigOptions::default(), |_| true)
+
+        // Both sides use the default config: `dimpl13` advertises SRTP
+        // (`use_srtp`) with `SrtpProfile::ALL` by default, so SRTP is
+        // negotiated automatically.
+        let mut server = DtlsServer::bind("127.0.0.1:0", |_| true, ConfigOptions::default())
             .await
             .unwrap();
+        let addr = server.local_addr();
+
+        let (srv_tx, srv_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok(conn) = server.accept().await {
+                let km = timeout(T, conn.keying_material()).await.unwrap_or(None);
+                let _ = srv_tx.send(km);
+                let _ = timeout(Duration::from_millis(500), conn.recv()).await;
+            }
+        });
+
         let conn = connect_to(addr).await;
 
-        let km = timeout(T, conn.keying_material()).await;
-        assert!(km.is_ok(), "keying_material() must not hang");
+        let client_km = timeout(T, conn.keying_material())
+            .await
+            .expect("timeout")
+            .expect("client must export SRTP keying material");
+        let server_km = timeout(T, srv_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("server must export SRTP keying material");
 
-        // Either `Some((material, profile))` or `None` is valid depending on
-        // whether SRTP was negotiated. Both sides must agree when present.
-        if let Some((material, _profile)) = km.unwrap() {
-            assert!(!material.is_empty(), "keying material must not be empty");
-        }
+        // Same bytes on both sides (RFC 5764 §4.2).
+        assert_eq!(client_km.0, server_km.0, "keying material must match");
+        // Same profile on both sides.
+        assert_eq!(
+            format!("{:?}", client_km.1),
+            format!("{:?}", server_km.1),
+            "profile must match"
+        );
+        // Length matches the profile.
+        assert_eq!(client_km.0.len(), client_km.1.keying_material_len());
 
         let _ = conn.close().await;
     }

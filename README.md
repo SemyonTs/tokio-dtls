@@ -125,7 +125,7 @@ If `anchor_from_trusted_cert` cannot parse an anchor (e.g. it is not a CA certif
 
 ## Supported DTLS 1.3 extensions
 
-Four protocol features are exposed through `dimpl13::Config` and, where they have an observable result, through `DtlsConnection`:
+Five protocol features are exposed through `dimpl13::Config` and, where they have an observable result, through `DtlsConnection`:
 
 | Feature | Direction | How to configure | How to read |
 |---|---|---|---|
@@ -133,6 +133,7 @@ Four protocol features are exposed through `dimpl13::Config` and, where they hav
 | **SNI** (RFC 6066) | client → server | `Config::builder().server_name("example.com")` | `DtlsConnection::peer_server_name()` |
 | **Connection ID** (RFC 9146) | both | `Config::builder().connection_id(&[…])` | transparent |
 | **Record Size Limit** (RFC 8449) | both, asymmetrical | `Config::builder().record_size_limit(1200)` | transparent |
+| **SRTP keying material** (RFC 5764 / RFC 7714) | both | advertised by default via `SrtpProfile::ALL` | `DtlsConnection::keying_material()` |
 
 Details:
 
@@ -140,8 +141,9 @@ Details:
 - **SNI.** The client sends a server name; the server can read it via `peer_server_name()`. Always `None` on the client (SNI is a client-only signal). tokio-dtls does **not** validate that the SNI matches the peer's certificate — that's the application's policy.
 - **Connection ID.** Requires **both** sides to configure one; otherwise it is silently disabled and the wire format falls back to the standard record header. Transparent to `send` / `recv`. This is the mechanism that keeps a session alive across NAT rebinding.
 - **Record Size Limit.** Each side advertises a maximum outgoing record size; the peer's limit is applied to our outgoing records. Default `16385` (`Config::default()`). Asymmetrical: it is enough for one side to set it. Useful for constrained networks or path-MTU-constrained tunnels.
+- **SRTP keying material.** `dimpl13` advertises `use_srtp` with `SrtpProfile::ALL` by default and exports keying material after a successful handshake in which SRTP was negotiated. See [Keying material (DTLS-SRTP)](#keying-material-dtls-srtp).
 
-The process-wide shared `Config` (used when `ConfigOptions::dtls_config` is `None`) advertises **no ALPN, no SNI, no Connection ID**, and the default Record Size Limit. **To enable any of these, build your own `Arc<Config>` once at startup** and pass it via [`ConfigOptions::dtls_config`](https://docs.rs/tokio-dtls/latest/tokio_dtls/struct.ConfigOptions.html#structfield.dtls_config).
+The process-wide shared `Config` (used when `ConfigOptions::dtls_config` is `None`) advertises **no ALPN, no SNI, no Connection ID**, and the default Record Size Limit. **To enable any of these, build your own `Arc<Config>` once at startup** and pass it via [`ConfigOptions::dtls_config`](https://docs.rs/tokio-dtls/latest/tokio_dtls/struct.ConfigOptions.html#structfield.dtls_config). SRTP needs no explicit configuration — it is on by default.
 
 ```rust
 use std::sync::Arc;
@@ -198,7 +200,7 @@ This example uses the process-wide shared `Config` — no ALPN, no SNI, no Conne
 
 ## Keying material (DTLS-SRTP)
 
-`dimpl13` emits `Output::KeyingMaterial(material, profile)` (RFC 5764 / RFC 7714) after a handshake in which `use_srtp` was negotiated. tokio-dtls forwards that variant and exposes it via [`DtlsConnection::keying_material`](https://docs.rs/tokio-dtls/latest/tokio_dtls/struct.DtlsConnection.html#method.keying_material):
+`dimpl13` advertises SRTP (`use_srtp`) with all supported profiles ([`SrtpProfile::ALL`]) by default and emits `Output::KeyingMaterial(material, profile)` (RFC 5764 / RFC 7714) after a handshake in which SRTP was negotiated. `tokio-dtls` forwards that variant and exposes it via [`DtlsConnection::keying_material`](https://docs.rs/tokio-dtls/latest/tokio_dtls/struct.DtlsConnection.html#method.keying_material):
 
 ```rust
 use tokio_dtls::{DtlsConnection, SrtpProfile};
@@ -206,24 +208,25 @@ use tokio_dtls::{DtlsConnection, SrtpProfile};
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let conn = DtlsConnection::connect("127.0.0.1:4433", |_| true).await?;
 if let Some((material, profile)) = conn.keying_material().await {
-    println!("SRTP profile: {:?}, {} bytes", profile, material.len());
+    println!("SRTP profile: {profile:?}, {} bytes", material.len());
     // feed `material` + `profile` into your SRTP context
 }
 # Ok(())
 # }
 ```
 
-- `material` is the raw exported key material. For `SRTP_AES128_CM_HMAC_SHA1_80` this is **60 bytes** (`2 × (16 + 14)`); for `SRTP_AEAD_AES_128_GCM`, **56 bytes** (`2 × (16 + 12)`).
-- `profile` is re-exported as [`SrtpProfile`](https://docs.rs/tokio-dtls/latest/tokio_dtls/enum.SrtpProfile.html) so callers do not need a direct `dimpl13` dependency.
+- `material` is the raw exported key material. Length depends on the selected profile:
+  - `SrtpProfile::AES128_CM_SHA1_80` — **60 bytes** (`2 × (16 + 14)`).
+  - `SrtpProfile::AEAD_AES_128_GCM` — **56 bytes** (`2 × (16 + 12)`).
+  - `SrtpProfile::AEAD_AES_256_GCM` — **88 bytes** (`2 × (32 + 12)`).
+- `profile` is re-exported as [`SrtpProfile`](https://docs.rs/tokio-dtls/latest/tokio_dtls/enum.SrtpProfile.html) so callers do not need a direct `dimpl13` dependency. The enum is `#[non_exhaustive]`; match with a trailing `_` arm.
 - Byte layout follows RFC 5764 §4.2: `client_write_key || server_write_key || client_write_salt || server_write_salt`. Both sides export the same bytes.
 
-### Status in `dimpl13 0.10.2`
-
-**`dimpl13 0.10.2` does not expose a public `ConfigBuilder` method to enable `use_srtp`.** As a result, the engine on the default shared config never emits `Output::KeyingMaterial`, and `keying_material().await` resolves to `None`. The method is exposed in `tokio-dtls` for forward compatibility — applications running against a newer `dimpl13` (or a custom build that negotiates `use_srtp`) will receive the material transparently. On `0.10.2` there is no way to enable SRTP from within `tokio-dtls`; if your SRTP stack requires it, use `dimpl13` directly once it grows the corresponding builder method, or upgrade this crate when `dimpl13` does.
+**No explicit configuration is required.** `dimpl13` offers `use_srtp` in every handshake with `SrtpProfile::ALL`, so `keying_material().await` resolves to `Some((material, profile))` as soon as the handshake completes against a peer that also supports SRTP. It returns `None` only when the peer did not negotiate `use_srtp` (e.g. a non-WebRTC peer that ignored the extension), or when the engine exits without producing it.
 
 ## Multiplexing: `DtlsServer`
 
-[`DtlsServer`](https://docs.rs/tokio-dtls/latest/tokio_dtls/struct.DtlsServer.html) binds one `UdpSocket` and demultiplexes incoming datagrams by peer address, spawning a per-peer DTLS engine. Each accepted `DtlsConnection` is fully independent: its own handshake, its own certificate validator, its own ALPN/SNI/CID.
+[`DtlsServer`](https://docs.rs/tokio-dtls/latest/tokio_dtls/struct.DtlsServer.html) binds one `UdpSocket` and demultiplexes incoming datagrams by peer address, spawning a per-peer DTLS engine. Each accepted `DtlsConnection` is fully independent: its own handshake, its own certificate validator, its own ALPN/SNI/CID, its own keying material.
 
 ```rust
 use tokio_dtls::{ConfigOptions, DtlsServer};
@@ -277,7 +280,7 @@ For `DtlsServer`:
 - **Asynchrony.** `dimpl13` is a Sans-IO engine that you embed in your own event loop. `tokio-dtls` does this for you: it creates the socket, starts a background task, handles timers and packets, and exposes asynchronous methods.
 - **Tokio integration.** It uses `tokio::net::UdpSocket`, `tokio::sync::mpsc`, and `tokio::time`. All operations (`send`, `recv`, `close`) are `async`.
 - **Multiplexing.** `DtlsServer` demultiplexes many peers over one `UdpSocket`. For single-peer use, `DtlsConnection::accept` reads the first datagram to determine the peer address and **connects the socket to that peer** — one socket, one client. Prefer `DtlsServer` for multi-peer workloads.
-- **Shared config and certificate.** Process-global `Arc<Config>` and `Arc<DtlsCertificate>` are created lazily on first use and reused. This removes the cost of `Config::builder().build()` and `generate_self_signed_certificate()` from every handshake. The shared config, however, offers none of the negotiated extensions above.
+- **Shared config and certificate.** Process-global `Arc<Config>` and `Arc<DtlsCertificate>` are created lazily on first use and reused. This removes the cost of `Config::builder().build()` and `generate_self_signed_certificate()` from every handshake. The shared config, however, offers none of the negotiated extensions above (SRTP is the exception — it is on by default).
 - **The `warmup` function.** It allows one-time initialization (`aws-lc-rs`, `rcgen`, provider validation — up to ~90 ms on some platforms) to be moved into a predictable application startup phase.
 - **Keying material.** `Output::KeyingMaterial` is forwarded to `DtlsConnection::keying_material()` when `use_srtp` is negotiated. `SrtpProfile` is re-exported for convenience.
 - **Certificate validators.** Two ready-made validators (`PinnedCertValidator`, `WebPkiVerifier`) are provided, and the `CertValidator` type alias is available for custom policies.
@@ -384,6 +387,7 @@ The WebPKI tests are feature-gated; the default test run does not compile or dow
 
 - Lifecycle: `connect` / `accept` / `send` / `recv` / `close` / `wait_closed`, idempotent close, `try_send` after close.
 - Extensions: ALPN (success + mismatch), SNI (read on the server), Connection ID, Record Size Limit.
+- SRTP: `srtp_keying_material_matches` verifies that both sides export identical keying material and agree on the profile, and that the material length matches `SrtpProfile::keying_material_len()`.
 - Multiplexing: three concurrent peers over one `DtlsServer`, `session_count()`.
 - Certificate validation: `PinnedCertValidator` accept/reject, custom closure, `WebPkiVerifier` accept/reject/name-mismatch.
 - Errors: invalid address, rejected certificate, handshake timeout on ALPN mismatch.
@@ -395,7 +399,7 @@ The WebPKI tests are feature-gated; the default test run does not compile or dow
 - **Status**:
   - Session resumption is not implemented (WebRTC performs a full handshake on ICE restart).
   - Renegotiation is not applicable in DTLS 1.3; use `KeyUpdate`.
-  - **SRTP keying material** is exposed via `DtlsConnection::keying_material()`, but `dimpl13 0.10.2` does not yet provide a public API to enable `use_srtp`; see [Status in `dimpl13 0.10.2`](#status-in-dimpl13-0102).
+  - **SRTP keying material** is advertised by `dimpl13` by default and exported via `DtlsConnection::keying_material()`. `SrtpProfile` is re-exported as `tokio_dtls::SrtpProfile`.
   - **WebPKI certificate validation** is available behind the opt-in `webpki` feature. Without it, tokio-dtls has no WebPKI dependency.
   - **Pinning** (`PinnedCertValidator`) is always available with no extra dependency.
 
